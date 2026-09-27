@@ -119,12 +119,19 @@ build spends its time:
   cost) plus a `Cut_3` against the merged and unmerged results, which is how the
   2.85× boolean speedup it buys was measured. This one PASSED and ships (as
   `unifyFragmented`, applied to boolean results).
-- `examples/csg-shell-build.ts` — a self-contained microbenchmark of the two ways
-  to turn a facet set into a closed shell: per-triangle faces + `Sewing.Perform`
-  (today's path) against one shared `TopoDS_Edge` per vertex pair + `TopoDS_Shell`
-  (2.9×, but its closure check does not yet agree — see roadmap 5.2). It also
-  times the `sewing=false` ctor flag, which is 2.45× faster and returns an EMPTY
-  `SewedShape()`, so it must not be used.
+- `examples/csg-shell-build.ts` — how a facet set should become a solid. It builds
+the same 256-triangle torus three ways (fresh edges + `Sewing`; one shared
+`TopoDS_Edge` per vertex pair + a hand-assembled `TopoDS_Shell`; shared edges +
+`Sewing`), closed **and** deliberately opened, and reports volume, face/edge
+counts, `BRepCheck_Analyzer` validity and `ShapeAnalysis_Shell` free edges. Pass
+`[model.csg]` to print the shipped build's own time/volume/face count. **Result:
+FAILED** — `BRep_Builder.Add` deep-copies each face (two faces sharing three
+edges give a six-edge shell), so no hand-assembled shell is valid, and sharing
+edges while keeping `Sewing` saves nothing because `Sewing` rebuilds its own
+edges (it halves `MakeEdge` calls, which are 0.1s of an 18.9s build). The same
+file also times the 5-arg ctor's `sewing` flag, which is 1.4× faster and returns
+an EMPTY `SewedShape()` — a trap, not a win. See the "Kernel-blocked"
+Non-goals entry in `doc/roadmap.md`.
 
 ## Where results go
 
