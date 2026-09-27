@@ -29,6 +29,9 @@
  *   orientation fix (below). Verified: square pyramid sews to 0 free edges.
  * - N-gon prism (faceted cylinders): wire + face + `MakePrism_1`, volume
  *   exact vs analytic `(N/2)r²sin(2π/N)h` — the `addPrism` recipe.
+ * - hull: `convexHull3d` (pure TS, no OCCT — OCCT ships no convex hull) over
+ *   the children's tessellated vertices, then the SAME facet→solid path
+ *   `polyhedron` uses (`solidFromFacets`).
  *
  * Memory discipline: every created handle is pushed into `cleanup` (the
  * `meshExtract.ts`/`occtOperations.ts` convention); the RETURNED shape is
@@ -39,6 +42,8 @@
 import type { CsgNode } from "./csgImport";
 import { resolveSegments } from "./csgImport";
 import { buildFlatFace } from "./occtOperations";
+import { convexHull3d } from "./convexHull";
+import { tessellateShape } from "./meshExtract";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Oc = any;
@@ -53,6 +58,37 @@ const AFFINE_LAST_ROW: [number, number, number, number] = [0, 0, 0, 1];
 function keep<T extends { delete(): void }>(cleanup: Cleanup, h: T): T {
   cleanup.push(h);
   return h;
+}
+
+/** Frees an OCCT handle NOW instead of at the end of the build, and drops it
+ * from `cleanup` so it is not freed twice.
+ *
+ * The `.csg` walk builds far more intermediates than the rest of this codebase:
+ * a `difference` with N subtrahends performs N cuts and a `union` of N operands
+ * N-1 fuses, and every one of those results used to stay alive until the whole
+ * tree finished. Measured on `S4i_Pico_IB_V210_Mouldable_SnapFit.scad`: the full
+ * enclosure aborted with `wasmTable.get(...) is not a function` at 2m46s until
+ * each superseded accumulator (and each spent subtrahend) was released as soon
+ * as it was replaced. Only handles this module OWNS may be released — never one
+ * that is still an element of the operand list, since a failed combine returns
+ * that list intact.
+ *
+ * **This is load-bearing, not an optimization — re-verified by A/B.** Holding
+ * every performed BOP alive (the `occtOperations.ts` recipe, which is safe
+ * there because an edit op list performs a handful of booleans rather than
+ * hundreds) makes the same enclosure fail outright with
+ * `OCCT crashed (abort(undefined))`. So the algorithm handle is deleted as soon
+ * as its result is in hand, and each superseded accumulator and spent
+ * subtrahend is released here. `algo.Shape()` returns a reference-counted copy
+ * of the result, which is what makes both safe. */
+function release(cleanup: Cleanup, h: unknown): void {
+  const i = cleanup.indexOf(h as { delete(): void });
+  if (i >= 0) cleanup.splice(i, 1);
+  try {
+    (h as { delete(): void }).delete();
+  } catch {
+    /* already freed with its owner */
+  }
 }
 
 function num(v: unknown): number | undefined {
@@ -71,15 +107,49 @@ function pnt(oc: Oc, p: [number, number, number], cleanup: Cleanup): unknown {
   return keep(cleanup, new oc.gp_Pnt_3(p[0], p[1], p[2]));
 }
 
+/** Signed volume of a shape (in the source's units³) — SIGNED, because
+ * `orientPositive` below depends on the sign to detect a reversed solid.
+ * `NaN` when the integration produced no usable number. */
+function shapeVolume(oc: Oc, shape: Shape, cleanup: Cleanup): number {
+  void cleanup;
+  const props = new oc.GProp_GProps_1();
+  try {
+    oc.BRepGProp.VolumeProperties2(shape, props, 1e-3, false, false);
+    const v = props.Mass() as number;
+    return Number.isFinite(v) ? v : NaN;
+  } finally {
+    props.delete();
+  }
+}
+
+/** Did a union silently lose geometry? `IsDone()` is NOT sufficient.
+ *
+ * Measured on `S4i_Pico_IB_V210_Mouldable_SnapFit.scad`: the bottom tray's snap
+ * bosses meet the tray wall on the SHARED PLANE y = 16.0, and fusing them onto
+ * the tray returns a solid of 504.19 mm³ where OpenSCAD's own render of the same
+ * subtree is 11435.56 — while `IsDone()` reports true, so nothing upstream
+ * noticed. Same hazard `rib()` documented for a coplanar touch generally.
+ *
+ * A union can never be smaller than its largest operand, so that bound is a
+ * cheap and reliable detector (and it stays valid when the operands overlap,
+ * where the true union is smaller than the sum). */
+function unionLostGeometry(oc: Oc, a: Shape, b: Shape, result: Shape, cleanup: Cleanup): boolean {
+  const va = Math.abs(shapeVolume(oc, a, cleanup));
+  const vb = Math.abs(shapeVolume(oc, b, cleanup));
+  const vr = Math.abs(shapeVolume(oc, result, cleanup));
+  if (!Number.isFinite(vr)) return true;
+  const floor = Math.max(va, vb);
+  if (!Number.isFinite(floor)) return false;
+  return vr < floor * (1 - 1e-6) - 1e-9;
+}
+
 /** Canonical "positive" orientation — the same rule `occtOperations.ts`'s
  * (private) `orientPositiveVolume` enforces for thin features: a reversed
  * solid reports NEGATIVE volume into every consumer, so flip it. Probed:
  * a CCW-wound pyramid sews to volume −266.67 without this. */
 function orientPositive(oc: Oc, solid: Shape, cleanup: Cleanup): Shape | null {
-  const props = keep(cleanup, new oc.GProp_GProps_1());
-  oc.BRepGProp.VolumeProperties2(solid, props, 1e-3, false, false);
-  const v = props.Mass() as number;
-  if (!Number.isFinite(v) || Math.abs(v) < 1e-9) return null;
+  const v = shapeVolume(oc, solid, cleanup);
+  if (!Number.isFinite(v) || v < 1e-9) return null;
   return v < 0 ? keep(cleanup, solid.Reversed()) : solid;
 }
 
@@ -354,12 +424,107 @@ function buildPolyhedron(oc: Oc, node: CsgNode, cleanup: Cleanup, warn: (m: stri
     warn(`polyhedron with <4 faces (or unparseable faces=) — skipping`);
     return null;
   }
+  return solidFromFacets(oc, points, faces, cleanup, warn, "polyhedron");
+}
+
+/**
+ * `hull()` — the convex hull of every child's TESSELLATED vertices.
+ *
+ * Not a transform, so it cannot be passed through: `hull()` REPLACES its
+ * children. Skipping it (the previous behaviour) drops the geometry entirely —
+ * the moulded enclosure that motivated this fix built to volume 0.001 against
+ * OpenSCAD's own 32109.77, because 23 hulls vanished and the top-level
+ * `difference()` then had no minuend left to cut.
+ *
+ * Why tessellated vertices rather than B-rep vertices: a `cylinder` has only
+ * two seam vertices, so hulling those yields a degenerate sliver instead of a
+ * prism. This is also exactly OpenSCAD's own semantics — it hulls the faceted
+ * polyset, not an analytic surface — so the tessellation is agreement, not an
+ * approximation. `tessellateShape` is the same 0.1 mm display tessellator the
+ * viewer uses; the existing `useMaxFN` faceting dial still decides whether the
+ * child itself was built analytic or as a real N-gon prism.
+ *
+ * Scope, stated plainly: a 2-D `hull()` (children spanning no volume, e.g. two
+ * circles) is NOT imported. The points are coplanar, `convexHull3d` returns
+ * null, and the subtree is skipped with a warning — OpenSCAD's 2-D hull is a
+ * distinct operation this importer has no representation for, and emitting a
+ * flat face where a solid belongs would be confidently-wrong geometry.
+ */
+function buildHull(
+  oc: Oc,
+  node: CsgNode,
+  cleanup: Cleanup,
+  warn: (m: string) => void,
+  useMaxFN: number,
+): Shape | null {
+  const kids = node.children.flatMap((c) => tryShapes(oc, c, cleanup, warn, useMaxFN));
+  if (kids.length === 0) {
+    warn(`hull() — every child was skipped, nothing to hull`);
+    return null;
+  }
+
+  const points: Array<[number, number, number]> = [];
+  let unmeshable = 0;
+  for (const s of kids) {
+    try {
+      for (const buf of tessellateShape(oc, s)) {
+        const pos = buf.positions;
+        for (let i = 0; i + 2 < pos.length; i += 3) points.push([pos[i], pos[i + 1], pos[i + 2]]);
+      }
+    } catch (e) {
+      // Skip just this child: a hull of the remaining points is still a far
+      // better answer than dropping the whole hull (which is how the moulded
+      // enclosure lost its geometry).
+      unmeshable++;
+      warn(`hull() child tessellation threw (${e instanceof Error ? e.message : String(e)}) — leaving that child out`);
+    }
+  }
+  if (unmeshable > 0 && points.length < 4) {
+    warn(`hull() — ${unmeshable} child(ren) could not be meshed and nothing else remained — skipping`);
+    return null;
+  }
+  if (points.length < 4) {
+    warn(`hull() — fewer than 4 points across its children — skipping`);
+    return null;
+  }
+
+  const hull = convexHull3d(points);
+  if (!hull) {
+    warn(`hull() — children do not span a volume (collinear/coplanar points; a 2-D hull is not imported) — skipping`);
+    return null;
+  }
+
+  const solid = solidFromFacets(oc, hull.points, hull.facets.map((f) => [...f]), cleanup, warn, "hull");
+  if (!solid) return null;
+  warn(`hull() — hulled ${points.length} tessellated point(s) into ${hull.facets.length} facet(s)`);
+  return solid;
+}
+
+/**
+ * Sews a triangulated facet set into a solid — the shared tail of
+ * `polyhedron` (facets from the `.csg` text) and `hull` (facets from
+ * `convexHull.ts`): per-face `MakeWire_1` + `MakeEdge_3` +
+ * `MakeFace_15(wire, true)`, then `BRepBuilderAPI_Sewing(SEW_TOL, ...)` + a
+ * `NbFreeEdges() == 0` closure gate (the promotion pipeline's own check) +
+ * `MakeSolid_3` + the orientation fix.
+ *
+ * `label` names the caller in every warning, so a skipped subtree still says
+ * which construct was responsible.
+ */
+function solidFromFacets(
+  oc: Oc,
+  points: Array<[number, number, number]>,
+  faces: number[][],
+  cleanup: Cleanup,
+  warn: (m: string) => void,
+  label: string,
+): Shape | null {
   try {
     const gpPts = points.map((q) => pnt(oc, q, cleanup));
     const brepFaces: Shape[] = [];
     for (const f of faces) {
       if (f.length < 3 || f.some((x) => !(Number.isInteger(x) && x >= 0 && x < points.length))) {
-        warn(`polyhedron with out-of-range face index — skipping`);
+        warn(`${label} with out-of-range face index — skipping`);
         return null;
       }
       // fan-triangulate N-gons
@@ -369,7 +534,7 @@ function buildPolyhedron(oc: Oc, node: CsgNode, cleanup: Cleanup, warn: (m: stri
           const e = keep(cleanup, new oc.BRepBuilderAPI_MakeEdge_3(gpPts[a], gpPts[b]));
           wireMk.Add_1(e.Edge());
         }
-        if (!wireMk.IsDone()) { warn(`polyhedron face failed to wire — skipping`); return null; }
+        if (!wireMk.IsDone()) { warn(`${label} face failed to wire — skipping`); return null; }
         brepFaces.push(keep(cleanup, new oc.BRepBuilderAPI_MakeFace_15(wireMk.Wire(), true)).Face());
       }
     }
@@ -377,17 +542,17 @@ function buildPolyhedron(oc: Oc, node: CsgNode, cleanup: Cleanup, warn: (m: stri
     for (const f of brepFaces) sew.Add(f);
     sew.Perform(keep(cleanup, new oc.Handle_Message_ProgressIndicator_1()));
     if (sew.NbFreeEdges() > 0) {
-      warn(`polyhedron did not close (${sew.NbFreeEdges()} free edges) — skipping`);
+      warn(`${label} did not close (${sew.NbFreeEdges()} free edges) — skipping`);
       return null;
     }
     const exp = keep(cleanup, new oc.TopExp_Explorer_2(sew.SewedShape(), oc.TopAbs_ShapeEnum.TopAbs_SHELL, oc.TopAbs_ShapeEnum.TopAbs_SHAPE));
-    if (!exp.More()) { warn(`polyhedron produced no shell — skipping`); return null; }
+    if (!exp.More()) { warn(`${label} produced no shell — skipping`); return null; }
     const solid = keep(cleanup, new oc.BRepBuilderAPI_MakeSolid_3(oc.TopoDS.Shell_1(exp.Current()))).Solid();
     const oriented = orientPositive(oc, solid, cleanup);
-    if (!oriented) { warn(`polyhedron collapsed to zero volume — skipping`); return null; }
+    if (!oriented) { warn(`${label} collapsed to zero volume — skipping`); return null; }
     return oriented;
   } catch (e) {
-    warn(`polyhedron build threw (${e instanceof Error ? e.message : String(e)}) — skipping`);
+    warn(`${label} build threw (${e instanceof Error ? e.message : String(e)}) — skipping`);
     return null;
   }
 }
@@ -492,8 +657,59 @@ function nodeMatrix(node: CsgNode, warn: (m: string) => void): number[] | null {
   }
 }
 
+/** `A = s·R` with `R` orthogonal? Returns `s`, or `null` when the 3×3 needs a
+ * general `gp_GTrsf`.
+ *
+ * **The check has to live here, in JS: this build's OCCT no longer validates
+ * it.** `gp_Trsf.SetValues` is documented to raise
+ * `Standard_ConstructionError` for a non-similarity, but probed live it
+ * ACCEPTED `diag(1, 2, 3)` without a word — this WASM ships no C++ exception
+ * runtime (the same gap that surfaces an OCCT throw as
+ * `___cxa_can_catch is not defined` elsewhere in this file), so the guard is
+ * silently absent and a shear routed here would be stored as a wrong
+ * transformation, not rejected. A genuinely non-uniform matrix misses on row
+ * norms by a factor of two or more, so a relative `1e-9` test cannot
+ * misclassify one.
+ *
+ * Why the split earns its keep — one cylinder (r=2, h=10) under a rigid
+ * rotate + translate, which is what every `multmatrix` in a real `.scad` is:
+ *
+ * | path | volume | surface type |
+ * | --- | --- | --- |
+ * | `BRepBuilderAPI_GTransform_2` | 125.658588 | 6 = BSplineSurface |
+ * | `BRepBuilderAPI_Transform_2` | 125.663706 | 1 = Cylinder |
+ *
+ * The exact value is πr²h = 125.663706, so the general path also APPROXIMATES
+ * analytic surfaces (this repo's own ±4e-5 translated-revolve note) — and, far
+ * more expensively downstream, it hands the next boolean a BSpline patch where
+ * an analytic cylinder would have been. Uniform scale (×2.5 → 1963.495408,
+ * exact) and a reflection (volume unchanged, type preserved) ride the same
+ * path; only shear and non-uniform scale fall through to `gp_GTrsf`. */
+function similarityScale(m: number[]): number | null {
+  const rows: Array<[number, number, number]> = [
+    [m[0], m[1], m[2]],
+    [m[4], m[5], m[6]],
+    [m[8], m[9], m[10]],
+  ];
+  const dot = (a: [number, number, number], b: [number, number, number]): number =>
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+  const norms = rows.map((r) => dot(r, r));
+  if (!norms.every((n) => Number.isFinite(n) && n > 1e-18)) return null;
+  const mean = (norms[0] + norms[1] + norms[2]) / 3;
+  const tol = mean * 1e-9;
+  if (norms.some((n) => Math.abs(n - mean) > tol)) return null;
+  if (Math.abs(dot(rows[0], rows[1])) > tol) return null;
+  if (Math.abs(dot(rows[0], rows[2])) > tol) return null;
+  if (Math.abs(dot(rows[1], rows[2])) > tol) return null;
+  return Math.sqrt(mean);
+}
+
 /** Applies a row-major 4×4 to every shape. The last row must be affine;
- * shear needs NO special path (`gp_GTrsf` is general 3×4 — probed). */
+ * shear needs NO special path (`gp_GTrsf` is general 3×4 — probed).
+ *
+ * Rigid, uniform-scale and mirrored matrices take the `gp_Trsf` route instead
+ * (`similarityScale`); they are the overwhelming majority of `.csg` transforms
+ * and are the only ones that keep a cylinder analytic. */
 function applyMatrix(oc: Oc, shapes: Shape[], m: number[], cleanup: Cleanup, warn: (m: string) => void): Shape[] | null {
   for (let i = 0; i < 4; i++) {
     if (Math.abs(m[12 + i] - AFFINE_LAST_ROW[i]) > 1e-9) {
@@ -501,9 +717,16 @@ function applyMatrix(oc: Oc, shapes: Shape[], m: number[], cleanup: Cleanup, war
       return null;
     }
   }
+  const uniform = similarityScale(m);
   const out: Shape[] = [];
   for (const s of shapes) {
     try {
+      if (uniform !== null) {
+        const t = keep(cleanup, new oc.gp_Trsf_1());
+        t.SetValues(m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11]);
+        out.push(keep(cleanup, new oc.BRepBuilderAPI_Transform_2(s, t, true)).Shape());
+        continue;
+      }
       const g = keep(cleanup, new oc.gp_GTrsf_1());
       for (let r = 1; r <= 3; r++) for (let c = 1; c <= 4; c++) g.SetValue(r, c, m[(r - 1) * 4 + (c - 1)]);
       out.push(keep(cleanup, new oc.BRepBuilderAPI_GTransform_2(s, g, true)).Shape());
@@ -520,7 +743,6 @@ function applyMatrix(oc: Oc, shapes: Shape[], m: number[], cleanup: Cleanup, war
 // ---------------------------------------------------------------------------
 
 const SKIP_SUBTREE_MSGS: Record<string, string> = {
-  hull: "hull() has no OCCT equivalent — skipping",
   minkowski: "minkowski() has no OCCT equivalent — skipping",
   text: "text() carries a font name, not outlines (the reference WASM ships with no font support) — skipping",
   import: "import() references an external file — skipping",
@@ -538,12 +760,190 @@ function booleanOf(oc: Oc, kind: "union" | "subtract" | "intersect", a: Shape, b
     kind === "union" ? oc.BRepAlgoAPI_Fuse_3
     : kind === "subtract" ? oc.BRepAlgoAPI_Cut_3
     : oc.BRepAlgoAPI_Common_3;
-  const algo = keep(cleanup, new Ctor(a, b));
-  if (!algo.IsDone()) return null;
-  const r = algo.Shape();
-  cleanup.push(r);
-  if (typeof r.IsNull === "function" && r.IsNull()) return null;
-  return r;
+  // The algorithm object is freed as soon as the result is in hand, NOT kept
+  // alive in `cleanup` until the end of the build. A performed BOP retains its
+  // argument lists and full interference history, and a `.csg` tree performs
+  // dozens of them, so holding them all is what exhausted the Emscripten heap
+  // (measured: the enclosure aborted with `wasmTable.get(...) is not a
+  // function`). `Shape()` returns a reference-counted copy, so the result
+  // outlives its algorithm — which is also what makes it safe for callers to
+  // release an operand once its boolean has been consumed.
+  const algo = new Ctor(a, b);
+  try {
+    if (!algo.IsDone()) return null;
+    const r = algo.Shape();
+    cleanup.push(r);
+    if (typeof r.IsNull === "function" && r.IsNull()) return null;
+    return r;
+  } finally {
+    algo.delete();
+  }
+}
+
+/** `TopTools_ListOfShape` — the only OCCT list type this codebase has verified
+ * (the `addVolumeFromSurfaces` recipe). */
+type ShapeList = { Append_1(s: Shape): void; delete(): void };
+
+function shapeListOf(oc: Oc, shapes: Shape[], cleanup: Cleanup): ShapeList {
+  const list = keep(cleanup, new oc.TopTools_ListOfShape_1()) as ShapeList;
+  for (const s of shapes) list.Append_1(s);
+  return list;
+}
+
+function isNullShape(s: Shape): boolean {
+  return typeof s?.IsNull === "function" && s.IsNull() === true;
+}
+
+/**
+ * ONE `BRepAlgoAPI` for a whole operand list instead of a pairwise fold — the
+ * single biggest cost in a real `.scad` import.
+ *
+ * Profiled on `S4i_Pico_IB_V210_Mouldable_SnapFit.scad` with the committed probe
+ * harness (`npm run scad:check -- … --profile`): of a 280 s build, 17 pairwise
+ * `Fuse_3` calls cost **90.7 s** and 28 `Cut_3` calls **157.3 s** — 88 % of the
+ * import, at ~5.4 s per call, because every step re-processes an accumulator
+ * that has already grown to the size of the finished part. One call over the
+ * whole list pays the interference computation once.
+ *
+ * The working form is the BOPAlgo one: `Fuse_1` + `SetArguments([first])` +
+ * `SetTools(rest)` + `Build()`. It must NOT be `BRepAlgoAPI_BuilderAlgo_1`
+ * (OCCT's "general fuse"), which looks like the natural choice and is a trap:
+ * on four operands that touch or overlap it returns the right VOLUME but leaves
+ * them as **5 solids / 6 shells / 36 faces** instead of the pairwise fold's
+ * **1 solid / 1 shell / 18 faces** — the same shape, unglued. Measured on the
+ * enclosure that unglued form built in 21.8s against 280s (and with the right
+ * volume, 32047.4 against 32064.8) but then made `tessellateByGroup` never
+ * finish at all, where the pairwise result meshes in 1.5s: 31 solids / 4733
+ * faces of coincident geometry, handed to the mesher. The BOPAlgo form instead
+ * reproduces the fold's topology exactly (1/1/18, volume 2500.000, valid) in
+ * ONE call, and probe #4 measures it at 63ms against the fold's 163ms on that
+ * same four-operand case.
+ *
+ * `BRepAlgoAPI_Fuse_1` + `SetArguments(all)` with no tools is NOT usable either
+ * — an empty tools list gives `IsDone() === false`, and `Shape()` without
+ * `Build()` returns empty. `BOPAlgo_BOP`/`BOPAlgo_Builder` are unbound in this
+ * build.
+ *
+ * `intersection` deliberately keeps the pairwise fold: no multi-argument
+ * `Common` form was probed, and the cost is in the union and the difference.
+ */
+function multiUnion(oc: Oc, shapes: Shape[], cleanup: Cleanup): Shape | null {
+  const algo = new oc.BRepAlgoAPI_Fuse_1();
+  const lists: ShapeList[] = [];
+  try {
+    const args = shapeListOf(oc, [shapes[0]], cleanup);
+    const toolList = shapeListOf(oc, shapes.slice(1), cleanup);
+    lists.push(args, toolList);
+    algo.SetArguments(args);
+    algo.SetTools(toolList);
+    algo.Build();
+    if (!algo.IsDone()) return null;
+    const r = algo.Shape();
+    cleanup.push(r);
+    return isNullShape(r) ? null : r;
+  } finally {
+    algo.delete();
+    // `Build` copies the lists into the algorithm's own structures, so the lists
+    // themselves are spent. The OPERANDS are deliberately left in `cleanup`:
+    // they are small beside the result, and `release`'s own rule forbids freeing
+    // a shape that any caller-supplied list might still hold.
+    for (const l of lists) release(cleanup, l);
+  }
+}
+
+/**
+ * ONE cut with every subtrahend supplied as a separate TOOL, which is the form
+ * OCCT is designed around — `Cut_1` + `SetArguments([minuend])` +
+ * `SetTools(tools)` + `Build()`.
+ *
+ * Probed on a 40×20×5 plate minus three boxes (analytic 3865): **89 ms →
+ * 3865.000 exact**, against 145 ms → 3865.000 pairwise.
+ *
+ * The pairwise loop's own comment records why the tools must NOT be
+ * pre-compounded (an 18-tool compound returned 134.89 mm³ where the true
+ * difference is 13001.15). That is about handing OCCT ONE compound, whose
+ * members then interfere with each other *as a single argument*. A tool LIST is
+ * the multi-operand form the class exists to accept, so this uses it — with
+ * `cutSound`'s volume bound and the pairwise loop as the fallback, and with the
+ * whole-model result verified against the known-good pairwise build before this
+ * shipped.
+ */
+function multiCut(oc: Oc, minuend: Shape, tools: Shape[], cleanup: Cleanup): Shape | null {
+  const algo = new oc.BRepAlgoAPI_Cut_1();
+  const lists: ShapeList[] = [];
+  try {
+    const args = shapeListOf(oc, [minuend], cleanup);
+    const toolList = shapeListOf(oc, tools, cleanup);
+    lists.push(args, toolList);
+    algo.SetArguments(args);
+    algo.SetTools(toolList);
+    algo.Build();
+    if (!algo.IsDone()) return null;
+    const r = algo.Shape();
+    cleanup.push(r);
+    return isNullShape(r) ? null : r;
+  } finally {
+    algo.delete();
+    for (const l of lists) release(cleanup, l);
+  }
+}
+
+/** A union can be neither smaller than its largest operand nor larger than the
+ * sum of the operands. Both bounds are cheap (the operands are small beside the
+ * result) and they catch the two ways a boolean silently lies: dropping
+ * material — `unionLostGeometry`'s own measured case — and keeping material
+ * that should have merged away. */
+function unionSound(oc: Oc, operands: Shape[], result: Shape, cleanup: Cleanup): boolean {
+  const vr = Math.abs(shapeVolume(oc, result, cleanup));
+  if (!Number.isFinite(vr)) return false;
+  let max = 0;
+  let sum = 0;
+  let seen = false;
+  for (const s of operands) {
+    const v = Math.abs(shapeVolume(oc, s, cleanup));
+    if (!Number.isFinite(v)) continue;
+    seen = true;
+    if (v > max) max = v;
+    sum += v;
+  }
+  if (!seen) return true;
+  if (vr < max * (1 - 1e-6) - 1e-9) return false;
+  return vr <= sum * (1 + 1e-6) + 1e-9;
+}
+
+/** A cut may only REMOVE material: `0 ≤ V(result) ≤ V(minuend)`. */
+function cutSound(oc: Oc, minuend: Shape, result: Shape, cleanup: Cleanup): boolean {
+  const vm = Math.abs(shapeVolume(oc, minuend, cleanup));
+  const vr = Math.abs(shapeVolume(oc, result, cleanup));
+  if (!Number.isFinite(vm) || !Number.isFinite(vr)) return false;
+  return vr <= vm * (1 + 1e-6) + 1e-9;
+}
+
+/**
+ * Evaluates one child subtree, containing a fault to that child alone.
+ *
+ * A `.csg` walk is deep and many operands wide, so a single bad operand must not
+ * cost the whole model. That is a real, measured failure here rather than a
+ * theoretical one: this OCCT build surfaces a C++ exception raised inside a
+ * boolean as a plain JS `ReferenceError` (`___cxa_can_catch is not defined` —
+ * the Emscripten exception runtime is absent), and before this containment one
+ * such throw unwound all the way to `buildCsgShape`'s per-root `catch`, which
+ * replaced the ENTIRE part with an empty compound. Measured on the moulded
+ * enclosure: the bottom tray's eighth cut threw, `props.Mass()` came back `0`,
+ * and an 11.5 cm³ part vanished from the render — leaving a view showing only
+ * six loose fragments. The module survives the throw (verified: the same
+ * process went on to construct, measure and tessellate afterwards), so skipping
+ * just the offending subtree is both safe and strictly better.
+ */
+function tryShapes(
+  oc: Oc, child: CsgNode, cleanup: Cleanup, warn: (m: string) => void, useMaxFN: number,
+): Shape[] {
+  try {
+    return evalShapes(oc, child, cleanup, warn, useMaxFN);
+  } catch (e) {
+    warn(`${child.name}() subtree threw (${e instanceof Error ? e.message : String(e)}) — skipping`);
+    return [];
+  }
 }
 
 function evalShapes(oc: Oc, node: CsgNode, cleanup: Cleanup, warn: (m: string) => void, useMaxFN: number): Shape[] {
@@ -553,37 +953,137 @@ function evalShapes(oc: Oc, node: CsgNode, cleanup: Cleanup, warn: (m: string) =
   const name = node.name;
   if (name === "group" || name === "color" || name === "render") {
     // transparent containers (color carries no geometry; render is a no-op)
-    return node.children.flatMap((c) => evalShapes(oc, c, cleanup, warn, useMaxFN));
+    return node.children.flatMap((c) => tryShapes(oc, c, cleanup, warn, useMaxFN));
   }
   if (name === "union" || name === "intersection") {
     // Note: the .csg verb is `intersection`, the boolean kind is `intersect`.
     const kind = name === "union" ? "union" : "intersect";
-    const kids = node.children.map((c) => evalShapes(oc, c, cleanup, warn, useMaxFN));
-    const all = kids.flat();
+    const all = node.children.flatMap((c) => tryShapes(oc, c, cleanup, warn, useMaxFN));
     if (all.length === 0) { warn(`${name}() — every child was skipped, nothing to combine`); return []; }
     if (all.length === 1) return all;
+    // One call over the whole operand list, before falling back to the fold —
+    // see `multiUnion`. `intersection` has no multi-argument counterpart.
+    if (kind === "union") {
+      let fast: Shape | null = null;
+      try {
+        fast = multiUnion(oc, all, cleanup);
+      } catch (e) {
+        warn(`union() — the single-call form threw (${e instanceof Error ? e.message : String(e)}) — combining pairwise`);
+        fast = null;
+      }
+      if (fast) {
+        if (unionSound(oc, all, fast, cleanup)) return [fast];
+        warn(`union() — the single-call form failed its volume bounds — combining pairwise`);
+      }
+    }
     let acc = all[0];
+    let accOwned = false;
+    let dropped = 0;
     for (const s of all.slice(1)) {
-      const r = booleanOf(oc, kind, acc, s, cleanup);
-      if (!r) { warn(`${name}() boolean did not complete (IsDone() false) — keeping operands uncombined`); return all; }
+      // Guard the UNION only: its result must contain at least the larger
+      // operand, so a smaller result is proof of a silent loss (see
+      // `unionLostGeometry`). An intersection has no such bound.
+      let r: Shape | null = null;
+      let lost = false;
+      try {
+        r = booleanOf(oc, kind, acc, s, cleanup);
+        lost = kind === "union" && r !== null && unionLostGeometry(oc, acc, s, r, cleanup);
+      } catch (e) {
+        warn(`${name}() — an operand threw (${e instanceof Error ? e.message : String(e)}) — leaving it out`);
+        r = null;
+      }
+      if (!r || lost) {
+        // Leave THIS operand out and keep fusing the rest. The previous
+        // behaviour — bailing out with every operand uncombined — handed the
+        // caller a compound of heavily overlapping solids for the next boolean
+        // to consume, which is the very "members interfere with EACH OTHER"
+        // hazard the `difference` fold below exists to avoid; it is also
+        // measurably worse here (11771 uncombined against an oracle of 11571,
+        // versus 11418 from the accumulator at the point the fuse failed).
+        dropped++;
+        continue;
+      }
+      // `acc` is superseded. Only a result WE built may be freed — `all[0]` is
+      // still an element of the operand list the failure path returns intact.
+      if (accOwned) release(cleanup, acc);
       acc = r;
+      accOwned = true;
+    }
+    if (dropped > 0) {
+      warn(
+        `${name}() — ${dropped} of ${all.length} operand(s) could not be combined and were left out of the result`,
+      );
+    }
+    if (!accOwned && all.length > 1) {
+      // Nothing combined at all — hand the operands back rather than an
+      // arbitrary single member.
+      warn(`${name}() — no operand could be combined; keeping ${all.length} operand(s) uncombined`);
+      return all;
     }
     return [acc];
   }
   if (name === "difference") {
     if (node.children.length === 0) { warn(`difference() with no children — skipping`); return []; }
-    const first = evalShapes(oc, node.children[0], cleanup, warn, useMaxFN);
-    const rest = node.children.slice(1).flatMap((c) => evalShapes(oc, c, cleanup, warn, useMaxFN));
+    const first = tryShapes(oc, node.children[0], cleanup, warn, useMaxFN);
+    const rest = node.children.slice(1).flatMap((c) => tryShapes(oc, c, cleanup, warn, useMaxFN));
     if (first.length === 0) {
       if (rest.length > 0) warn(`difference() — minuend was skipped, dropping ${rest.length} subtrahend solid(s)`);
       return [];
     }
     if (rest.length === 0) return first;
     let acc = first.length === 1 ? first[0] : compoundOf(oc, first, cleanup);
-    const tool = rest.length === 1 ? rest[0] : compoundOf(oc, rest, cleanup);
-    const r = booleanOf(oc, "subtract", acc, tool, cleanup);
-    if (!r) { warn(`difference() boolean did not complete — keeping minuend uncut`); return first; }
-    return [r];
+    let accOwned = first.length > 1;
+    // One cut with every subtrahend as a separate tool, before the one-at-a-time
+    // fold — see `multiCut`.
+    if (rest.length > 1) {
+      let fast: Shape | null = null;
+      try {
+        fast = multiCut(oc, acc, rest, cleanup);
+      } catch (e) {
+        warn(`difference() — the single-call form threw (${e instanceof Error ? e.message : String(e)}) — cutting one at a time`);
+        fast = null;
+      }
+      if (fast) {
+        if (cutSound(oc, acc, fast, cleanup)) return [fast];
+        warn(`difference() — the single-call form failed its volume bound — cutting one at a time`);
+      }
+    }
+    // Cut ONE subtrahend at a time, never as a single compound.
+    // `difference(a, b1..bn)` IS `a - b1 - ... - bn`, and handing OCCT one
+    // compound whose members interfere with EACH OTHER makes its BOP return a
+    // wrong result that still reports success — measured on the top cover: an
+    // 18-tool compound cut returned 134.89 mm³ of subtrahend geometry where
+    // OpenSCAD's render of the same subtree is 13001.15 (the same 18 tools
+    // union correctly, so the tool set itself is sound). Cutting singly gives
+    // every boolean two well-formed single-solid operands, and makes one
+    // subtrahend's failure local instead of discarding the whole difference.
+    let failed = 0;
+    for (const tool of rest) {
+      // One cut throwing must not cost the cuts that already succeeded.
+      let r: Shape | null = null;
+      try {
+        r = booleanOf(oc, "subtract", acc, tool, cleanup);
+      } catch (e) {
+        warn(
+          `difference() — a cut threw (${e instanceof Error ? e.message : String(e)}) — leaving that subtrahend uncut`,
+        );
+        r = null;
+      }
+      if (!r) { failed++; continue; }
+      // The tool has been applied and is never read again; the old accumulator
+      // is superseded. Releasing both keeps the live-shape count flat across
+      // what is otherwise N cuts on an ever-growing result.
+      release(cleanup, tool);
+      if (accOwned) release(cleanup, acc);
+      acc = r;
+      accOwned = true;
+    }
+    if (failed > 0) {
+      warn(
+        `difference() — ${failed} of ${rest.length} cut(s) did not complete; those subtrahends were left uncut`,
+      );
+    }
+    return [acc];
   }
   if (name === "multmatrix" || name === "translate" || name === "scale" || name === "mirror" || name === "rotate") {
     const m = nodeMatrix(node, warn);
@@ -601,6 +1101,7 @@ function evalShapes(oc: Oc, node: CsgNode, cleanup: Cleanup, warn: (m: string) =
   if (name === "sphere") return single(oc, buildSphere(oc, node, cleanup, warn, useMaxFN));
   if (name === "cylinder") return single(oc, buildCylinder(oc, node, cleanup, warn, useMaxFN));
   if (name === "polyhedron") return single(oc, buildPolyhedron(oc, node, cleanup, warn));
+  if (name === "hull") return single(oc, buildHull(oc, node, cleanup, warn, useMaxFN));
   if (name === "linear_extrude") return single(oc, buildLinearExtrude(oc, node, cleanup, warn, useMaxFN));
   if (name === "rotate_extrude") return single(oc, buildRotateExtrude(oc, node, cleanup, warn, useMaxFN));
 

@@ -52,6 +52,55 @@ Every probe write-up records:
 5. Cleanup behaviour, and a kernel reset after any deliberate abort.
 6. Wall-clock timing on the largest fixture that fits.
 
+## Load + render a model locally (SCAD/CSG)
+
+`examples/scad-load.ts` — `npm run scad:check -- <model.scad|model.csg>` — is the
+committed probe for "the viewer hangs (or is just slow) on my model": it runs the
+shipped `.scad` → `.csg` conversion, prints a construct histogram, builds the base
+shape with a **live per-construct trace**, then times tessellation / edges /
+vertices separately. No `.vsix` repackage, no extension reload.
+
+```sh
+npm run scad:check -- /path/model.scad --timeout 120   # bounded, prints the trace tail
+npm run scad:check -- /path/model.scad --worker        # the viewer's own path
+npm run scad:check -- /path/model.scad --render        # PNGs (render_snapshot's engine)
+npm run scad:check -- /path/model.csg --only-hull 0    # list the hull blocks
+npm run scad:check -- /path/model.csg --only-hull 9    # build ONLY hull #9
+npm run scad:check -- /path/model.csg --profile        # ms + calls by OCCT entry point
+```
+
+The trace is the point. `readShape`'s `"csg"` branch pushes a warning per
+completed construct (`hull() — hulled 472 point(s) into 244 facet(s)`), so the
+harness wraps that array and echoes each entry the moment it is pushed, stamped
+with `+ms` and RSS — **to stdout and to a trace file**. A hang therefore names
+the construct it hung in: the last line printed is the last thing that finished.
+`--timeout <sec>` re-executes the harness as a child and kills it on expiry
+(a synchronous WASM call cannot be interrupted in-process, and stdout through a
+pipe loses its tail on `SIGTERM`, which is why the file matters), printing the
+trace tail. `--worker` goes through the real `createKernelClient` and
+`dist/kernel-worker.js`, so it reproduces the viewer's
+`… did not respond within …ms` message rather than approximating it.
+`--only-hull <n>` builds just the nth `hull() { … }` block: the trace alone
+cannot say whether a long gap was spent *inside* a hull or in the boolean right
+after it, and rebuilding one hull alone settles it in seconds. The run ends with
+the five widest spans, so nobody has to eyeball the stamps.
+
+`--profile` goes one level deeper, to the **OCCT call**: it wraps every
+`BRepAlgoAPI_*` / `BRepBuilderAPI_*` / `BRepPrimAPI_*` / `BRepOffsetAPI_*` /
+`BRepMesh_*` / `GeomAPI_*` / `GC_*` / `ShapeFix_*` constructor plus the two-phase
+`Build`/`Perform` methods (where a deferred algorithm really runs) and the
+`BRepGProp` integration statics, then prints the top entry points by total time
+and call count, alongside the built shape's volume and topology. A span says
+*when*; this says *what the kernel was doing*. It is how a 280s enclosure build
+was attributed to 28 `Cut_3` calls (157.3s) and 17 `Fuse_3` calls (90.7s) rather
+than to the 23 `hull()` blocks it looked like — see `CLAUDE.md` for that
+finding and the fix that followed from it (`multiUnion`/`multiCut` plus the
+analytic-preserving transform path: 280s → 20s).
+
+Known cost, stated rather than hidden: `--render` re-loads the model inside
+`renderSnapshot` (there is no plumbing to hand it the shape already built), so it
+doubles the wall clock on a slow model.
+
 ## Where results go
 
 - **Pass:** the item's "If admitted" phases move into the roadmap's Tier 1

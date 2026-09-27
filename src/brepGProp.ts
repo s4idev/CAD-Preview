@@ -22,10 +22,21 @@
  * adaptive variants that exist purely because embind cannot disambiguate an
  * overload on `Standard_Real Eps` from one on `Standard_Boolean`. Probed:
  * all three are bound statics on `oc.BRepGProp`, and both used here work —
- * `VolumeProperties2(box, props, 1e-3, false, false)` returns exactly 24 on
- * the 2×3×4 reference box (no regression vs the fixed-order overload's own
- * verified value), and `SurfaceProperties2(shape, props, eps, skipShared)`
+ * `VolumeProperties2(box, props, 1e-3, false, false)` fills `props` with the
+ * 2×3×4 reference box's exact 24 (no regression vs the fixed-order overload's
+ * own verified value), and `SurfaceProperties2(shape, props, eps, skipShared)`
  * takes exactly 4 args in this binding.
+ *
+ * **These two wrappers' RETURN VALUE is NOT the integral — read `props`.** The
+ * binding hands back the `Eps` argument it was handed (probed: a 10 mm cube,
+ * the enclosure's `hull()` solid and an empty compound all return exactly
+ * `1e-3` = `MASS_INTEGRATION_EPS`, while `props.Mass()` gives 1000 / the
+ * correct volume / 0). Every call site in this codebase is a bare statement
+ * followed by a `props.Mass()` read, which is why the vestigial return has
+ * never mattered — but a probe or a new caller that trusts it measures the
+ * epsilon instead of the geometry and reports a plausible-looking `0.001` for
+ * a perfectly good solid. The return type stays `number` for signature
+ * stability.
  *
  * Every volume/surface integration site in the codebase goes through these
  * two wrappers so the eps and argument order can't drift between them

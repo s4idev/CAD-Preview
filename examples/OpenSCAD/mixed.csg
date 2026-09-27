@@ -1,8 +1,9 @@
-// mixed.csg — exercises the warning paths: hull() (no OCCT equivalent,
-// whole subtree skipped), a $fn=8 sphere (coarsely faceted in OpenSCAD,
-// imported analytic with a chord-error warning), and one clean cube
-// surviving alongside. Expect warnings on import, 2 solids (cube + sphere),
-// and NO hull geometry.
+// mixed.csg — exercises the hull() path and the warning paths: hull() of a
+// centred 4³ cube and an inscribed $fn=12 sphere (the sphere is inside the
+// cube, so the hull IS that cube — volume 64), a $fn=8 sphere (coarsely
+// faceted in OpenSCAD, imported analytic with a chord-error warning), and one
+// clean cube surviving alongside. Expect warnings on import and 3 solids
+// (cube + hull + sphere).
 group() {
   cube(size = [10, 10, 10], center = true);
   sphere($fn = 8, r = 5);

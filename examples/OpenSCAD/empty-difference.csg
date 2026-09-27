@@ -1,0 +1,17 @@
+// empty-difference.csg — a `difference()` whose subtrahend CONTAINS the
+// minuend, so the result is genuinely empty (a 10³ cube minus a 20³ cube).
+//
+// This is the regression pin for the empty-shape abort class: OCCT's
+// `BRepMesh_IncrementalMesh_2` on a shape with NO sub-shapes does not throw,
+// it aborts the whole WASM module with `wasmTable.get(...) is not a function`,
+// which poisons the kernel singleton. A `.csg` that evaluates to nothing is
+// reachable from real designs, so the importer must yield an empty model plus
+// a warning rather than taking the host down.
+//
+// Expected: loads successfully with 0 solids and no crash.
+group() {
+  difference() {
+    cube(size = [10, 10, 10], center = true);
+    cube(size = [20, 20, 20], center = true);
+  }
+}

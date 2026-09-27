@@ -27,11 +27,12 @@
  * - Built: `cube`, `sphere`, `cylinder`, `polyhedron`, `union`,
  *   `difference`, `intersection`, `group`, `color` (transparent — colour is
  *   not imported), `multmatrix`, `translate`, `rotate`, `scale`, `mirror`,
- *   `linear_extrude`/`rotate_extrude` of a single `polygon`/`square`/`circle`
- *   child (see `csgModel.ts`).
+ *   `hull` (convex hull of the children's tessellated vertices — see
+ *   `convexHull.ts`), `linear_extrude`/`rotate_extrude` of a single
+ *   `polygon`/`square`/`circle` child (see `csgModel.ts`).
  * - Skipped with a warning (whole subtree dropped — placing children without
  *   the operation would be confidently-wrong geometry, not a graceful
- *   subset): `hull`/`minkowski` (no OCCT equivalent), `text`/`import`/
+ *   subset): `minkowski` (no OCCT equivalent), `text`/`import`/
  *   `surface` (external files / fonts the reference WASM itself ships
  *   without), standalone 2D (`square`/`circle`/`polygon` outside an extrude),
  *   `linear_extrude` with `twist`/`scale`, `polygon` with `paths` (holes),

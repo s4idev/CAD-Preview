@@ -432,11 +432,30 @@ export function extractVertices(oc: any, shape: any): PointEntity[] {
 /**
  * Flat tessellation — kept for unit-test compatibility.
  * New callers should prefer tessellateByGroup.
+ *
+ * Carries the same empty-shape guard as {@link tessellateByGroup}: a
+ * `BRepMesh_IncrementalMesh_2` on a shape with **no sub-shapes at all** does
+ * not throw — it aborts the whole OCCT module with
+ * `wasmTable.get(...) is not a function`, which poisons the kernel singleton
+ * until it is reset. Reachable from a `.csg`/`.scad` import whose root
+ * evaluates to nothing (a `difference()` that cut its minuend away), and from
+ * any other caller handed a compound that contains no geometry. A shape with
+ * vertices but no faces meshes fine, so the threshold is "no sub-shapes",
+ * exactly as in `tessellateByGroup`.
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export function tessellateShape(oc: any, shape: any): GeometryBuffers[] {
   const cleanup: Array<{ delete(): void }> = [];
   try {
+    const anyVertex = new oc.TopExp_Explorer_2(
+      shape,
+      oc.TopAbs_ShapeEnum.TopAbs_VERTEX,
+      oc.TopAbs_ShapeEnum.TopAbs_SHAPE
+    );
+    const isEmpty = !anyVertex.More();
+    anyVertex.delete();
+    if (isEmpty) return [];
+
     const mesher = new oc.BRepMesh_IncrementalMesh_2(shape, 0.1, false, 0.5, false);
     cleanup.push(mesher);
     return extractFacesFromShape(oc, shape);

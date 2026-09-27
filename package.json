@@ -1,8 +1,8 @@
 {
   "name": "cad-preview",
-  "displayName": "CAD Preview",
+  "displayName": "CAD Preview @s4idev",
   "description": "Interactive 3D preview, non-destructive editing, and FE mesh generation for CAD and mesh files (STEP, IGES, BREP, STL, OBJ, PLY, glTF, VTK, MED, CGNS, and more) inside VS Code, with an MCP server for AI agents.",
-  "version": "3.6.0",
+  "version": "3.6.4",
   "publisher": "kratos-multiphysics",
   "license": "GPL-3.0-or-later",
   "icon": "images/icon.png",
@@ -416,6 +416,7 @@
     "mcp:smoke": "npm run build && node scripts/mcp-smoke/run.mjs",
     "perf": "npm run build && node scripts/perf/run.mjs",
     "probe": "node scripts/probe/run.mjs",
+    "scad:check": "node scripts/probe/run.mjs scripts/probe/examples/scad-load.ts",
     "test:webview": "npm run build && node scripts/screenshots/make-fixtures.mjs && node scripts/webview-test/run.mjs",
     "test:integration": "npm run build && node test/integration/run.mjs",
     "compat": "npm run build && node scripts/compat/run.mjs",

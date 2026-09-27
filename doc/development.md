@@ -32,6 +32,7 @@ npm install
 | `npm run mcp:smoke` | Build, then run the real-WASM end-to-end MCP smoke test (see [MCP Server](./mcp-server.md)) |
 | `npm run perf` | Build, then benchmark load/mesh times against `scripts/perf/baseline.json` |
 | `npm run probe -- <entry.ts>` | Build, then run a TypeScript probe against the real WASM kernels (see [Probing the WASM kernels](#probing-the-wasm-kernels)) |
+| `npm run scad:check -- <model.scad>` | Load a `.scad`/`.csg` model through the shipped pipeline outside the editor, with a per-construct progress trace, an optional watchdog, optional PNG renders (same section) |
 | `npm run test:webview` | Playwright assertions over the real viewer bundle (needs a display server) |
 | `npm run test:integration` | The host-side suite inside a real VS Code (needs a display server) |
 
@@ -73,6 +74,22 @@ npm run probe -- scripts/probe/examples/bull-counts.ts   # prints 36 faces / 98 
 ```
 
 Scratch probes go under `scripts/probe/scratch/` (git-ignored). The harness also runs under the Flatpak recipe above (`ELECTRON_RUN_AS_NODE=1 …/code scripts/probe/run.mjs …`), because it passes the environment through unchanged. [`scripts/probe/README.md`](https://github.com/loumalouomega/CAD-Preview/blob/master/scripts/probe/README.md) has the cleanup skeleton, the probe protocol and where a probe's result is recorded.
+
+A second committed entry, `scripts/probe/examples/scad-load.ts` (`npm run scad:check -- <model.scad|model.csg>`), is the fast loop for *"the viewer hangs, or is just slow, on my model"* — it needs no `.vsix` repackage and no extension reload. It runs the shipped `.scad` → `.csg` conversion, prints a construct histogram (`hull×23`, `cylinder×71`, …), then builds the base shape with a **live per-construct trace**: the walk's own warnings are echoed as they happen, stamped with elapsed ms and RSS, to stdout *and* to a trace file, so a hang names the construct it hung in — the last line printed is the last thing that finished. Tessellation, edge and vertex extraction are timed separately (a model can build fine and still be unusable because `BRepIncrementalMesh` is the slow part — two different problems).
+
+```sh
+npm run scad:check -- /path/model.scad --timeout 120   # bounded: kills at 120s, prints the trace tail
+npm run scad:check -- /path/model.scad --worker        # the viewer's own path (kernel client + worker)
+npm run scad:check -- /path/model.scad --render        # PNGs via render_snapshot's engine
+npm run scad:check -- /path/model.csg --only-hull 9    # build ONLY the 9th hull() {} block
+npm run scad:check -- /path/model.csg --profile        # ms and call counts by OCCT entry point
+```
+
+A run ends with its five widest spans (and a killed run's watchdog prints the same, parsed back out of the trace file), so the expensive construct is named without anyone reading stamps. `--only-hull <n>` is the tie-breaker when the gap could be either side of a construct boundary: the trace cannot say whether the time went *inside* a `hull()` or into the boolean immediately after it, and rebuilding one hull alone settles that in seconds.
+
+`--profile` narrows it further, to the **OCCT call itself**: it wraps every `BRepAlgoAPI_*` / `BRepBuilderAPI_*` / `BRepPrimAPI_*` / `BRepOffsetAPI_*` / `BRepMesh_*` / `GeomAPI_*` / `GC_*` / `ShapeFix_*` constructor (preserving `new`), the `Sewing.Perform` static, and `BRepGProp`'s integration statics, then prints the top entry points by total time and call count. The trace says *where* in the tree the time went; this says *what the kernel was doing* — which is how the enclosure's 280s build was attributed to 28 `Cut_3` calls (157.3s) and 17 `Fuse_3` calls (90.7s) rather than to the hulls it looked like. The same run prints the built shape's volume and topology counts, and names each post-build step before starting it, so a shape that builds fast but then stalls the mesher (a real failure mode — see the general-fuse note in `CLAUDE.md`) is attributed to the step that actually stalled.
+
+`--timeout <sec>` re-executes the harness as a child and kills it on expiry, so a five-minute hang costs `--timeout` seconds instead of five minutes (a synchronous WASM call cannot be interrupted from inside the same process, which is why the kill is out-of-process and the trace goes to a file — stdout through a pipe loses its tail on `SIGTERM`). `--worker` calls the real `createKernelClient`/`dist/kernel-worker.js`, reproducing the viewer's `… did not respond within …ms` message verbatim. `--csg <path>` (or a positional `.csg`) skips openscad entirely, which is what makes iterating on the *load* half cheap.
 
 The shared recipe lives in `scripts/nodeBundleConfig.mjs`, which `esbuild.mjs`, the screenshot fixture generator and the probe runner all import. Add a new WASM package to its `WASM_EXTERNALS` list once, rather than to each script.
 

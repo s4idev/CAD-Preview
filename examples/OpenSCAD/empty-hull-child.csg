@@ -1,0 +1,21 @@
+// empty-hull-child.csg — a `hull()` with one child that evaluates to NOTHING.
+//
+// The hull path tessellates each child to collect its vertices, and
+// `tessellateShape` on an empty compound is the documented module-abort case
+// (`BRepMesh_IncrementalMesh_2` on a shape with no sub-shapes →
+// `wasmTable.get(...) is not a function`). A real design reaches this easily —
+// any hull whose child is a `difference()` that cut itself away — so the empty
+// child must be skipped and the hull built from what remains.
+//
+// Expected: loads successfully, 1 solid, volume 64 (the hull of the 4³ cube;
+// the empty child contributes no points, silently — there is nothing to
+// report about a child that legitimately evaluates to nothing).
+group() {
+  hull() {
+    cube(size = [4, 4, 4], center = true);
+    difference() {
+      cube(size = [2, 2, 2], center = true);
+      cube(size = [8, 8, 8], center = true);
+    }
+  }
+}

@@ -319,16 +319,53 @@ try {
       Math.abs(reMass.volume - 5228.88) / 5228.88 < 0.005,
       `the exported STEP keeps the analytic volume through the round trip (got ${reMass.volume})`
     );
-    // mixed.csg exercises the warning paths: hull() skipped whole (its cube
-    // contributes NOTHING — 2 solids, not 3), $fn=8 sphere imported analytic
-    // with a chord-error warning. Both warnings must surface on load_model.
+    // mixed.csg exercises the hull() path and the warning paths: hull() of a
+    // centred 4³ cube and an inscribed $fn=12 sphere IS that cube (the sphere
+    // adds nothing, so 3 solids and 64 extra mm³), and the $fn=8 sphere is
+    // imported with a chord-error/faceting warning. Both must surface on
+    // load_model.
     const mixedCsg = path.join(dir, "mixed.csg");
     fs.copyFileSync(path.join(ROOT, "examples", "OpenSCAD", "mixed.csg"), mixedCsg);
     const mixed = await call("load_model", { path: mixedCsg });
-    assert(mixed.solids.length === 2, `mixed.csg loads cube + sphere only, hull contributes nothing (got ${mixed.solids.length} solids)`);
+    assert(mixed.solids.length === 3, `mixed.csg loads cube + hull + sphere (got ${mixed.solids.length} solids)`);
     assert(
-      mixed.warnings.some((w) => /hull\(\)/i.test(w)) && mixed.warnings.some((w) => /faceted|analytic/i.test(w)),
-      `mixed.csg surfaces the hull-skip and faceted-sphere warnings (got ${JSON.stringify(mixed.warnings)})`
+      mixed.warnings.some((w) => /hulled/i.test(w)) && mixed.warnings.some((w) => /faceted|analytic/i.test(w)),
+      `mixed.csg surfaces the hull-build and faceted-sphere warnings (got ${JSON.stringify(mixed.warnings)})`
+    );
+    const mixedMass = await call("get_mass_properties", { path: mixedCsg });
+    // cube 1000 + hull(=the same 4³ cube) 64 + a $fn=8 sphere (analytic r=5 is
+    // 523.60; the faceted import differs slightly) — a degenerate hull would
+    // still give 3 solids but forfeit the 64.
+    assert(
+      Math.abs(mixedMass.volume - 1587.6) / 1587.6 < 0.02,
+      `mixed.csg builds the hull (expected ~1587.6 = 1000 + 64 + sphere, got ${mixedMass.volume})`
+    );
+    // The empty-shape abort class, pinned. `BRepMesh_IncrementalMesh_2` on a
+    // shape with NO sub-shapes does not throw — it aborts the whole WASM module
+    // (`wasmTable.get(...) is not a function`), poisoning the kernel singleton.
+    // A `.csg` can reach both routes: a `difference()` that removes everything
+    // (the shape itself is empty), and a `hull()` with a child that does (the
+    // hull path tessellates each child). Before the guard, either one took the
+    // server down rather than returning an empty model. These two blocks are
+    // the regression pins.
+    const emptyDiffCsg = path.join(dir, "empty-difference.csg");
+    fs.copyFileSync(path.join(ROOT, "examples", "OpenSCAD", "empty-difference.csg"), emptyDiffCsg);
+    const emptyDiff = await call("load_model", { path: emptyDiffCsg });
+    assert(
+      emptyDiff.solids.length === 0,
+      `a .csg whose difference() removes everything loads as an EMPTY model, not an abort (got ${emptyDiff.solids.length} solids)`
+    );
+    const emptyHullCsg = path.join(dir, "empty-hull-child.csg");
+    fs.copyFileSync(path.join(ROOT, "examples", "OpenSCAD", "empty-hull-child.csg"), emptyHullCsg);
+    const emptyHull = await call("load_model", { path: emptyHullCsg });
+    assert(
+      emptyHull.solids.length === 1,
+      `a hull() with an empty child still builds from the surviving children (got ${emptyHull.solids.length} solids)`
+    );
+    const emptyHullMass = await call("get_mass_properties", { path: emptyHullCsg });
+    assert(
+      Math.abs(emptyHullMass.volume - 64) < 1e-6,
+      `that hull is the surviving 4³ cube, exactly 64 (got ${emptyHullMass.volume})`
     );
     // extrude.csg (the .csg node-coverage extension): linear_extrude of a polygon, a
     // centered square and a faceted circle, plus rotate_extrude full and
@@ -3873,9 +3910,15 @@ try {
   );
 
   // Nastran bulk data (examples/Nastran/block-tets.bdf — this extension's own
-  // Gmsh export of block.stp). Routing and the ambiguity caveat work, but the
-  // current meshio++ reader rejects this deck even after BEGIN BULK
-  // normalization. Pin the known limitation until a reader/parser is added.
+  // Gmsh export of block.stp). Routing and the ambiguity caveat work, and the
+  // deck now IMPORTS AND REMESHES: the read-side `BEGIN BULK` normalization
+  // (`mcpSidecars.ts`) gives meshio++'s C++ reader the line it needs, so this
+  // asserts real geometry rather than a refusal. This block used to pin the
+  // opposite — a `Not a meshio++-C++ Nastran file` failure — which is exactly
+  // the "a fix flips the assertion" signal `CLAUDE.md` describes for a tracked
+  // upstream limitation, so the assertion moved with the capability instead of
+  // being loosened. `scripts/compat/corpus.json`'s `load-bdf-gmsh-export` row
+  // asserts the same thing independently.
   const bdfModel = path.join(dir, "block-tets.bdf");
   fs.copyFileSync(path.join(ROOT, "examples", "Nastran", "block-tets.bdf"), bdfModel);
   const bdfLoaded = await call("load_model", { path: bdfModel });
@@ -3887,14 +3930,13 @@ try {
     bdfLoaded.warnings.some((w) => /Nastran bulk-data deck/.test(w)),
     `load_model surfaces the .bdf ambiguity caveat (got: ${JSON.stringify(bdfLoaded.warnings)})`
   );
-  const bdfMeshing = await callTolerant("generate_mesh", {
+  const bdfMeshing = await call("generate_mesh", {
     path: bdfModel,
     options: { sizeMax: 1 },
   });
-  const bdfMeshingError = bdfMeshing.error ?? "";
   assert(
-    /Not a meshio\+\+-C\+\+ Nastran file/.test(bdfMeshingError),
-    `Gmsh-written .bdf reports the tracked meshio++ limitation (got: ${bdfMeshingError || (bdfMeshing.value ? "unexpected success" : "no error result")})`
+    bdfMeshing.nodeCount > 0 && bdfMeshing.elementCount > 0,
+    `generate_mesh on a Gmsh-written .bdf: ${bdfMeshing.nodeCount} nodes, ${bdfMeshing.elementCount} elements`
   );
 
   // OpenFOAM polyMesh import (examples/OpenFOAM/hex-case — see its README).
@@ -5143,15 +5185,38 @@ try {
     repairResult.nodeCount > 0 && repairResult.elementCount > 0 && fs.statSync(repairedStl).size > 0,
     `repair_mesh writes a non-empty repaired STL: ${repairResult.nodeCount} nodes, ${repairResult.elementCount} elements (got path size ${fs.statSync(repairedStl).size})`
   );
-  const postRepairHealth = await call("check_mesh_health", { path: repairedStl });
+  const postRepairHealth = await callWithCleanRetry(
+    "check_mesh_health",
+    { path: repairedStl },
+    // Read-only over a file this block just wrote: nothing for the retry to
+    // collide with (the `render_ops_prefix` precedent). Guarded because this
+    // is the single heaviest OCCT allocation in the whole suite — one face per
+    // boundary triangle of an fTetWild output, sewn right after fTetWild has
+    // churned the same worker's heap — which is exactly the position the
+    // documented accumulated-pressure abort class shows up in. Measured: a run
+    // that had already auto-recovered one abort 11,000 log lines earlier
+    // aborted HERE and failed the suite, while an isolated repeat of this same
+    // sequence passes, so the guard (not a product change) is the remedy.
+    () => {}
+  );
   assert(
     postRepairHealth.components[0].freeEdgeCount === 0 && postRepairHealth.components[0].requiredTolerance !== null,
     `check_mesh_health(repaired-cube.stl) after repair: watertight, closes at a real tolerance (got: ${JSON.stringify(postRepairHealth.components[0])})`
   );
-  const promoteAfterRepair = await call("promote_mesh_to_brep", {
-    path: repairedStl,
-    outputPath: path.join(dir, "repaired-cube.step"),
-  });
+  const repairedStep = path.join(dir, "repaired-cube.step");
+  const promoteAfterRepair = await callWithCleanRetry(
+    "promote_mesh_to_brep",
+    { path: repairedStl, outputPath: repairedStep },
+    // Writing step: drop anything a partially-completed attempt could have left
+    // behind, so the retry cannot observe it.
+    () => {
+      try {
+        fs.rmSync(repairedStep, { force: true });
+      } catch {
+        /* nothing to remove */
+      }
+    }
+  );
   assert(
     promoteAfterRepair.promotedComponents.length === 1 && promoteAfterRepair.skippedComponents.length === 0,
     `promote_mesh_to_brep succeeds on the repaired mesh where the original could not (got: ${JSON.stringify(promoteAfterRepair)})`

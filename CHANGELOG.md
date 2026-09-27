@@ -4,6 +4,91 @@ All notable changes to the "CAD Preview" extension are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); this project does not yet strictly follow Semantic Versioning (pre-1.0 releases moved fast and bundled multiple features per bump).
 
+## [3.6.4] - 2026-09-27
+
+### Fixed
+
+- **OpenSCAD `.csg`/`.scad` imports are 12.9× faster, and the model no longer trips the
+  kernel watchdog.** A moulded enclosure (23 `hull()`, 71 `cylinder()`, 123 `multmatrix`,
+  2 `difference()`, 1 `union()`) took 280s to build — more than the 300s kernel timeout
+  allowed for IPC and display prep, so opening it failed with
+  `"loadBRepCachedForDocument" did not respond within 300000ms`. Profiling by OCCT entry
+  point showed 88% of that build was the pairwise boolean fold: **157.3s in 28 `Cut_3`
+  calls and 90.7s in 17 `Fuse_3` calls**, each step re-processing an accumulator that had
+  already grown to the size of the finished part. The same model now loads in 22s.
+  - The union and the difference are each **one `BRepAlgoAPI` per node**, driven by
+    operand lists (`Fuse_1`/`Cut_1` + `SetArguments`/`SetTools` + `Build()`).
+  - `multmatrix` now keeps analytic surfaces: rigid, uniform-scale and mirrored matrices
+    take `gp_Trsf` + `BRepBuilderAPI_Transform_2` instead of `gp_GTrsf` +
+    `BRepBuilderAPI_GTransform_2`, which was converting every transformed cylinder to a
+    BSpline approximation (volume 125.658588 instead of the exact 125.663706 on a test
+    cylinder) and handing those patches to the booleans. Shear and non-uniform scale still
+    use the general transform.
+  - Both fast paths fall back to the previous pairwise fold — visibly, with a warning —
+    when a call throws, reports `IsDone() === false`, or fails a volume bound, so a
+    rejected optimization cannot ship a wrong shape silently.
+- **Booleans no longer silently drop operands.** The old union fold lost 4 of the
+  enclosure's 18 operands on coplanar touches; the multi-operand form merges all 18. The
+  volume moves 32064.75 → 32047.38 mm³ against OpenSCAD's own 32109.77, and a rendered
+  comparison against the pre-change images differs in 0.11% of pixels at 20% colour fuzz,
+  all of it thin edge lines — no feature, hole or silhouette change.
+- **Stale Nastran import expectations corrected (tests and docs only).** `npm run mcp:smoke`
+  still pinned a `Not a meshio++-C++ Nastran file` failure for a Gmsh-written `.bdf`, a
+  limitation meshio++ 16.x had already removed once `BEGIN BULK` normalization was added —
+  so a full smoke run could not pass. The block now asserts real geometry, matching the
+  `load-bdf-gmsh-export` row in `scripts/compat/corpus.json`, which already expected a
+  successful load and remesh (verified: `nastran · remesh 1255 el`). `doc/file-formats.md`,
+  `CLAUDE.md` and the roadmap's Nastran item said the same stale thing and were corrected.
+
+### Added
+
+- **OCCT call profiling in the probe harness**: `npm run scad:check -- <model> --profile`
+  reports time and call counts by OCCT entry point (booleans, transforms, mesh, the
+  gprop statics), which is what located both causes above. The harness also reports the
+  built shape's volume and topology and names each post-build step as it starts.
+
+## [3.6.3] - 2026-09-26
+
+### Fixed
+
+- **OpenSCAD `.csg`/`.scad` imports no longer lose most of the model.** A real two-piece
+  enclosure rendered as a handful of loose fragments — 8415 mm³ against OpenSCAD's own
+  32109.77 — because of two independent defects in the CSG walk, both only reachable on a
+  model with real booleans:
+  - A `union()` whose fuse silently lost geometry on a coplanar touch bailed out by handing
+    the next boolean a compound of 18 overlapping solids. It now leaves that one operand out
+    and keeps fusing, so the union stays a single well-formed solid and the loss is local
+    and reported (`union() — N of M operand(s) could not be combined and were left out`).
+  - A `cut` raising a C++ exception (surfacing as `___cxa_can_catch is not defined`, since
+    this OCCT build ships no Emscripten exception runtime) unwound to the importer's top
+    level and replaced the **entire part** with an empty compound. A failing cut is now
+    contained to itself, and a faulting subtree no longer costs its siblings.
+
+  The same enclosure now comes out at 32064.75 mm³ against the 32109.77 oracle (−0.14%),
+  with its bounding box matching exactly.
+- **An empty result no longer aborts the kernel.** `tessellateShape` was missing the
+  empty-shape guard its sibling `tessellateByGroup` already had; OCCT's mesher does not
+  throw on a shape with no sub-shapes, it aborts the whole WASM module. Reachable from a
+  `hull()` whose child is a `difference()` that cut itself away, and from any `.csg` that
+  evaluates to nothing.
+
+### Added
+
+- **OpenSCAD `hull()` support.** `hull()` was skipped as having "no OCCT equivalent", which
+  for a hull is not approximation but deletion — it *replaces* its children, so 23 skipped
+  hulls left a top-level `difference()` with no minuend at all. A pure-TypeScript convex hull
+  (`src/convexHull.ts`) is computed over the children's tessellated vertices, which is both
+  forced (a cylinder has only two seam vertices) and exactly OpenSCAD's own semantics (it
+  hulls the faceted polyset, not an analytic surface). A 2-D `hull()` is still skipped with a
+  warning rather than emitted as a flat face where a solid belongs.
+- `examples/OpenSCAD/empty-difference.csg` and `empty-hull-child.csg`, pinning the
+  empty-shape abort class in `npm run mcp:smoke`.
+
+### Changed
+
+- The extension's display name is `CAD Preview @s4idev` in this local build. Versions
+  3.6.1–3.6.2 were local re-build bumps with no user-visible change.
+
 ## [3.6.0] - 2026-09-26
 
 ### Added
@@ -641,6 +726,9 @@ This release republishes v1.9.0's full changelog (below) unchanged; v1.9.0 itsel
 
 - Initial release: read-only 3D preview for CAD and mesh files (STEP, IGES, BREP, STL, OBJ, PLY, glTF) inside a VS Code custom editor, using OpenCascade.js (OCCT WASM) in the extension host for B-rep formats and Three.js in the webview for rendering.
 
+[3.6.4]: https://github.com/loumalouomega/CAD-Preview/compare/v3.6.3...v3.6.4
+[3.6.3]: https://github.com/loumalouomega/CAD-Preview/compare/v3.6.0...v3.6.3
+[3.6.0]: https://github.com/loumalouomega/CAD-Preview/compare/v3.5.0...v3.6.0
 [3.5.0]: https://github.com/loumalouomega/CAD-Preview/compare/v3.4.0...v3.5.0
 [3.4.0]: https://github.com/loumalouomega/CAD-Preview/compare/v3.3.0...v3.4.0
 [3.3.0]: https://github.com/loumalouomega/CAD-Preview/compare/v3.2.0...v3.3.0
