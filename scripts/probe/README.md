@@ -95,11 +95,36 @@ and call count, alongside the built shape's volume and topology. A span says
 was attributed to 28 `Cut_3` calls (157.3s) and 17 `Fuse_3` calls (90.7s) rather
 than to the 23 `hull()` blocks it looked like — see `CLAUDE.md` for that
 finding and the fix that followed from it (`multiUnion`/`multiCut` plus the
-analytic-preserving transform path: 280s → 20s).
+analytic-preserving transform path: 280s → 20s), and for the second pass that
+took the same model to **5.5s of build / 6.7s end to end** (same-domain cleanup
+after each boolean, plus coplanar hull facets merged before sewing).
 
 Known cost, stated rather than hidden: `--render` re-loads the model inside
 `renderSnapshot` (there is no plumbing to hand it the shape already built), so it
 doubles the wall clock on a slow model.
+
+Two more committed probes belong to the same loop, both about where a `.csg`
+build spends its time:
+
+- `examples/csg-solid-inventory.ts <model.csg>` — the per-solid inventory:
+  volume, face count, shell count and bounding box for every solid, plus a count
+  of bodies under 1mm³. This is the probe that decides whether a `.csg` build
+  produced *the design's* solid decomposition: total volume and `BRepCheck`
+  validity both survived the coplanar facet merge, while the enclosure silently
+  came back as 14 solids (two detached 2.7mm³ tabs and two zero-volume 2-face
+  sheets) instead of 10. Run it on any model before changing how facets,
+  operands or booleans are built.
+- `examples/csg-same-domain.ts <model.csg>` — builds one model and reports what
+  `ShapeUpgrade_UnifySameDomain_2` does to it (face count, volume delta, its own
+  cost) plus a `Cut_3` against the merged and unmerged results, which is how the
+  2.85× boolean speedup it buys was measured. This one PASSED and ships (as
+  `unifyFragmented`, applied to boolean results).
+- `examples/csg-shell-build.ts` — a self-contained microbenchmark of the two ways
+  to turn a facet set into a closed shell: per-triangle faces + `Sewing.Perform`
+  (today's path) against one shared `TopoDS_Edge` per vertex pair + `TopoDS_Shell`
+  (2.9×, but its closure check does not yet agree — see roadmap 5.2). It also
+  times the `sewing=false` ctor flag, which is 2.45× faster and returns an EMPTY
+  `SewedShape()`, so it must not be used.
 
 ## Where results go
 

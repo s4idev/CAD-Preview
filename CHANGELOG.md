@@ -4,6 +4,56 @@ All notable changes to the "CAD Preview" extension are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); this project does not yet strictly follow Semantic Versioning (pre-1.0 releases moved fast and bundled multiple features per bump).
 
+## [3.6.5] - 2026-09-27
+
+### Changed
+
+- **OpenSCAD `.csg`/`.scad` imports now leave a much lighter document behind.**
+  A same-domain cleanup pass (`ShapeUpgrade_UnifySameDomain_2`) runs on each
+  boolean result, so the moulded enclosure imports with **1312 faces instead of
+  2745** — its bottom tray with 187 instead of 1085, which is also the face count
+  the Components tree, the Parts picker and face selection have to work with.
+  Everything downstream follows: tessellation 1.31s → 0.72s, edge extraction
+  290ms → 167ms, and roughly half as many objects in the 3D view. Volumes are
+  unchanged to within 3e-9 relative; the pass is volume-guarded, `IsNull`-guarded,
+  wrapped in `try`/`catch` and skipped below 256 faces.
+- Shape volumes are now memoized by handle, removing repeated `GProp`
+  integration (47 `VolumeProperties2` calls → 41 on that model).
+
+### Fixed
+
+- **Corrected a `Sewing` flag that would have been silently wrong.** The 5-arg
+  `BRepBuilderAPI_Sewing` ctor's first flag (`sewing=false`) is 2.45× faster and
+  still reports a correct free-edge count — but `SewedShape()` comes back *empty*,
+  so a closure gate reading `NbFreeEdges() == 0` would have accepted a shell that
+  was never sewn. Probed, documented, not used.
+
+### Notes
+
+- **A 3.2× faster import was implemented, measured, and removed again — the
+  geometry it produced was not the geometry the design describes.** Merging each
+  coplanar group of a facet solid's triangles into one face (a geometry-preserving
+  reduction: same vertices, same planar region, same winding) cut the enclosure's
+  build from 19.4s to 5.5s, because the booleans then intersect far fewer faces.
+  It also made this OCCT build fail to glue a coplanar face-to-face contact: the
+  tray came back 5.451mm³ light, with two detached 2.725mm³ tabs and two
+  zero-volume 2-face sheets — 14 solids where the design has 10 — while the total
+  volume stayed exact, so nothing downstream noticed. Four remedies were measured
+  and all failed: exact-only merge tolerances (identical result), unifying the
+  solid after sewing instead of the facets before it (identical result),
+  `SetGlue` (`GlueShift` left six sub-1mm³ slivers, `GlueFull` collapsed the model
+  to 7772mm³), and re-fusing the detached pieces afterwards (`done=true`, still
+  two solids). `BRepAlgoAPI.SetFuzzyValue`, the standard remedy, is **not bound**
+  in this build. The import therefore stays on triangulated facets — correct, and
+  18.7s rather than 5.5s. Use
+  `npm run probe -- scripts/probe/examples/csg-solid-inventory.ts <model.csg>` to
+  see a model's per-solid decomposition before trusting any such change.
+- GPU acceleration was investigated for this pipeline and is not available: OCCT's
+  B-rep booleans are CPU-bound comparisons with no GPU path in `opencascade.js`
+  (and WebGL/WebGPU cannot evaluate B-rep intersections). The webview's rendering
+  was already GPU-driven; what the display actually paid for was the object count,
+  which is what the cleanup pass above now halves.
+
 ## [3.6.4] - 2026-09-27
 
 ### Fixed
@@ -726,6 +776,7 @@ This release republishes v1.9.0's full changelog (below) unchanged; v1.9.0 itsel
 
 - Initial release: read-only 3D preview for CAD and mesh files (STEP, IGES, BREP, STL, OBJ, PLY, glTF) inside a VS Code custom editor, using OpenCascade.js (OCCT WASM) in the extension host for B-rep formats and Three.js in the webview for rendering.
 
+[3.6.5]: https://github.com/loumalouomega/CAD-Preview/compare/v3.6.4...v3.6.5
 [3.6.4]: https://github.com/loumalouomega/CAD-Preview/compare/v3.6.3...v3.6.4
 [3.6.3]: https://github.com/loumalouomega/CAD-Preview/compare/v3.6.0...v3.6.3
 [3.6.0]: https://github.com/loumalouomega/CAD-Preview/compare/v3.5.0...v3.6.0

@@ -953,6 +953,25 @@ Only 4.10 depends on another item's *result*: adaptive remeshing needs the MMG c
   - **Fail:** recorded. The shared worker stays, and the trade-off is re-stated with numbers.
 - **If admitted (M):** `kernelClient.ts` maps each owner to a worker, and the watchdog and cancel paths kill only the owning worker.
 
+##### 5.2 Shared-edge shell construction for triangle soups {#shared-edge-shell-construction}
+
+*Area: Geometry.*
+
+- **Hypothesis:** a triangulated facet set can be turned into a closed shell with **no sewing at all** by creating one `TopoDS_Edge` per vertex pair and reusing it (as-is, or `TopoDS.Edge_1(e.Reversed())`) in both adjacent triangles' wires, then assembling the faces into a `TopoDS_Shell` with `BRep_Builder.Add`. `BRepBuilderAPI_Sewing` exists to *discover* coincident edges by tolerance search; a facet set built from shared points already knows them.
+- **Evidence today:** measured on a 256-triangle closed torus (`npm run probe -- scripts/probe/examples/csg-shell-build.ts`), where the two constructions build the identical surface:
+  - today's path — 256 × (3 `MakeEdge` + `MakeWire` + `MakeFace`) = 227ms, then `Sewing.Perform` = 302ms: **528ms**;
+  - shared-edge path — the same 256 faces in 181ms, plus a 0.4ms shell and a 1.4ms `ShapeAnalysis_Shell` check: **183ms** (2.9×).
+  Hull construction is what remains expensive in a `.csg` import: **23 `Sewing.Perform` calls are 4.5s of the enclosure's 18.7s build** (and `BRepBuilderAPI_MakeFace` another 2.3s over 3510 calls) — the largest single non-boolean item, now that the coplanar facet merge that briefly cut the face count ~5× has been **removed** (it changed what the booleans saw and broke a coplanar contact — see CLAUDE.md's "second pass" section). This item is therefore back to being the main remaining lever on `.csg` import cost.
+- **The probe is UNRESOLVED, not passed — do not ship it on this evidence.** The shared-edge shell reported `ShapeAnalysis_Shell.HasFreeEdges() == true` where sewing reports 0 free edges, and the probe never checked `BRepBuilderAPI_MakeWire.IsDone()`, so either the reversed-edge handling is wrong (`MakeWire.Add` may reject or copy a reversed edge) or a wire was empty and its face invalid. Also unverified: whether a bare `TopoDS_Shell()` is constructible in this build (`TopoDS.Shell_1` and `BRep_Builder.MakeShell` are the forms used elsewhere).
+- **Probe (S) — finish it before estimating:**
+  1. Rebuild the shell with `MakeWire.IsDone()` asserted per face, and record whether `TopoDS_Shell()` constructs.
+  2. Assert `BRepCheck_Analyzer` validity, the exact solid volume, and an identical face/edge count against the sewing path on the same facet set.
+  3. Keep the closure gate honest: a deliberately opened facet set must still be rejected (sewing's `NbFreeEdges()`, or an equivalent check that does not depend on sewing).
+  4. Time both paths end to end on the moulded enclosure, and on `polyhedron` input whose facets do NOT share vertex objects (the fallback case).
+- **Decision gate:**
+  - **Pass:** identical volume and validity, a closure check that still fires on an open set, and a real time win. Then `solidFromFacets` uses the shared-edge shell, with sewing kept as the fallback for facet sets that do not share vertices exactly (a hand-written `polyhedron` with duplicated coordinates).
+  - **Fail:** recorded here with the failed calls; sewing stays.
+
 ### 6. Strategic — multi-phase bets {#strategic-—-multi-phase-bets}
 
 *Admission: an L-sized, multi-phase effort that gates other items or reopens Non-goals. Each starts with its own probe, and nothing below it is estimated until that probe reports.*

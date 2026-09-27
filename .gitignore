@@ -55,3 +55,16 @@ test/integration/.build/
 scripts/compat/last-run.json
 scripts/probe/scratch/
 scripts/probe/.build/
+
+# Per-document sidecars the extension writes beside a CAD source, plus the
+# one-deep <model>.bak save backup and the generated .geo script. These are
+# per-user state, never fixtures — checked against the index: no tracked file
+# matches any of them (the .csg/.stp/.stl fixtures are NOT affected).
+*.edits.json
+*.parts.json
+*.annotations.json
+*.planes.json
+*.mesh.json
+*.view.json
+*.geo
+*.bak

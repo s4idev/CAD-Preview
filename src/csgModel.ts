@@ -37,6 +37,44 @@
  * `meshExtract.ts`/`occtOperations.ts` convention); the RETURNED shape is
  * also in `cleanup` — its lifetime belongs to the caller, exactly like
  * `applyEditsBRep`'s contract.
+ *
+ * ## Do NOT merge a facet solid's coplanar triangles (measured, rejected)
+ *
+ * `solidFromFacets` emits one face per triangle even though adjacent triangles
+ * are frequently exactly coplanar — a *tessellated* cylinder's side is made of
+ * planar strips, and a `hull()` emits raw triangles. Merging each coplanar group
+ * into one polygon is a geometry-preserving reduction (same vertices, same
+ * planar region, same winding) and it was implemented and measured: **build
+ * 19.2s → 5.5s** on the moulded enclosure, face count 2745 → 584, sewing
+ * 4.5s → 1.0s, and the booleans 9.3s → 3.0s, because the BOP then intersects
+ * far fewer faces.
+ *
+ * It is NOT here, because it changes what the BOOLEANS see and **this OCCT
+ * build then fails to glue a coplanar face-to-face contact**: on the enclosure
+ * the tray came back 5.451mm³ lighter (2 × 2.725523mm³ tabs detached) with two
+ * extra zero-volume 2-face sheets, i.e. 14 solids where the design has 10. The
+ * total volume stayed exact, so nothing below catches it — only the solid
+ * decomposition does. Ruled out by measurement, in this order:
+ *
+ * - **Tolerance.** Tightening the merge tolerances to exact-only (`1e-12`
+ *   normal, `diagonal×1e-12` offset) changed nothing at all — the groups being
+ *   merged really are exactly coplanar.
+ * - **Where the unification happens.** Unifying the *solid* after sewing
+ *   instead of the facets before it reproduces the same 14 solids.
+ * - **OCCT's own remedies.** `SetFuzzyValue` is **unbound** in this build, and
+ *   the bound `SetGlue` modes are worse, not better: `GlueShift` left six
+ *   sub-1mm³ slivers and a 11417mm³ tray, `GlueFull` collapsed the model to
+ *   7772mm³ over 21 solids.
+ * - **Repairing afterwards.** Re-`Fuse_3`ing the detached tab into the tray
+ *   reports success and returns the same two solids (`done=true solids=2`), so
+ *   the pieces cannot be re-glued once they are built this way.
+ *
+ * The one variant that *is* correct — leaving the merged groups that lie on the
+ * solid's own bounding-box planes triangulated — costs the whole win (16.9s),
+ * precisely because those planes are the cylinder caps that make the merge worth
+ * doing. `npm run probe -- scripts/probe/examples/csg-solid-inventory.ts` is the
+ * per-solid inventory used to establish all of the above; run it on any model
+ * before touching this code.
  */
 
 import type { CsgNode } from "./csgImport";
@@ -109,13 +147,27 @@ function pnt(oc: Oc, p: [number, number, number], cleanup: Cleanup): unknown {
 
 /** Signed volume of a shape (in the source's units³) — SIGNED, because
  * `orientPositive` below depends on the sign to detect a reversed solid.
- * `NaN` when the integration produced no usable number. */
+ * `NaN` when the integration produced no usable number.
+ *
+ * **Memoized by handle identity**, which is safe because an OCCT shape is
+ * immutable: nothing in this file mutates a shape in place, it always builds a
+ * new one. The same wrapper object is genuinely re-measured several times per
+ * boolean without this — `orientPositive` measures a hull's solid, then
+ * `unionSound` measures it again as an operand, then `cutSound` does the same
+ * for the minuend. Measured on the moulded enclosure: 47
+ * `VolumeProperties2` calls costing 2.0s of a 19.2s build, for ~15 distinct
+ * shapes. */
+const volumeByShape = new WeakMap<object, number>();
+
 function shapeVolume(oc: Oc, shape: Shape, cleanup: Cleanup): number {
   void cleanup;
+  const cached = volumeByShape.get(shape);
+  if (cached !== undefined) return cached;
   const props = new oc.GProp_GProps_1();
   try {
     oc.BRepGProp.VolumeProperties2(shape, props, 1e-3, false, false);
     const v = props.Mass() as number;
+    if (Number.isFinite(v)) volumeByShape.set(shape, v);
     return Number.isFinite(v) ? v : NaN;
   } finally {
     props.delete();
@@ -508,6 +560,11 @@ function buildHull(
  * `NbFreeEdges() == 0` closure gate (the promotion pipeline's own check) +
  * `MakeSolid_3` + the orientation fix.
  *
+ * One face per triangle, deliberately: a coplanar-triangle merge was implemented
+ * and measured (3.2× on the build), but it changes what the BOOLEANS see and
+ * this OCCT build then fails to glue a coplanar face-to-face contact — see the
+ * module's own "Do NOT merge the facets" note.
+ *
  * `label` names the caller in every warning, so a skipped subtree still says
  * which construct was responsible.
  */
@@ -527,10 +584,12 @@ function solidFromFacets(
         warn(`${label} with out-of-range face index — skipping`);
         return null;
       }
-      // fan-triangulate N-gons
+      // Fan-triangulate N-gons. One face per triangle, deliberately — see
+      // `solidFromFacets`' doc comment for the measured reason the obvious
+      // "merge each coplanar group into one polygon" optimisation is NOT here.
       for (let i = 1; i + 1 < f.length; i++) {
         const wireMk = keep(cleanup, new oc.BRepBuilderAPI_MakeWire_1());
-        for (const [a, b] of [[f[0], f[i]], [f[i], f[i + 1]], [f[i + 1], f[0]]]) {
+        for (const [a, b] of [[f[0], f[i]], [f[i], f[i + 1]], [f[i + 1], f[0]]] as Array<[number, number]>) {
           const e = keep(cleanup, new oc.BRepBuilderAPI_MakeEdge_3(gpPts[a], gpPts[b]));
           wireMk.Add_1(e.Edge());
         }
@@ -538,6 +597,7 @@ function solidFromFacets(
         brepFaces.push(keep(cleanup, new oc.BRepBuilderAPI_MakeFace_15(wireMk.Wire(), true)).Face());
       }
     }
+
     const sew = keep(cleanup, new oc.BRepBuilderAPI_Sewing(SEW_TOL, true, true, true, false));
     for (const f of brepFaces) sew.Add(f);
     sew.Perform(keep(cleanup, new oc.Handle_Message_ProgressIndicator_1()));
@@ -919,6 +979,138 @@ function cutSound(oc: Oc, minuend: Shape, result: Shape, cleanup: Cleanup): bool
   return vr <= vm * (1 + 1e-6) + 1e-9;
 }
 
+function countFaces(oc: Oc, shape: Shape): number {
+  const exp = new oc.TopExp_Explorer_2(
+    shape,
+    oc.TopAbs_ShapeEnum.TopAbs_FACE,
+    oc.TopAbs_ShapeEnum.TopAbs_SHAPE,
+  );
+  try {
+    let n = 0;
+    for (; exp.More(); exp.Next()) n++;
+    return n;
+  } finally {
+    exp.delete();
+  }
+}
+
+/**
+ * Merge same-domain faces on a boolean's RESULT (see `replaced`) — the one
+ * face-count reduction that survived measurement, because it never touches the
+ * operands of the boolean that produced it.
+ *
+ * A boolean fragmentizes its operands: the enclosure's `union()`/`difference()`
+ * leave faces where the geometry needs far fewer, because every coplanar plane
+ * the BOP touched stays its own face. Everything downstream pays for that count
+ * — the next boolean, `BRepMesh`, the edge extraction, the number of
+ * `THREE.Mesh` objects in the webview, and the STEP export. Measured on the
+ * enclosure with
+ * `npm run probe -- scripts/probe/examples/csg-same-domain.ts`:
+ *
+ * | | faces | volume |
+ * | --- | --- | --- |
+ * | as built | 2745 | 32047.3837 |
+ * | `ShapeUpgrade_UnifySameDomain_2(s, true, true, false)` | **552** | 32047.3836 |
+ *
+ * — a 5× reduction at a measured **−3e-9 relative** volume change (the pass
+ * merges within the shape's own tolerance), and a `Cut_3` against that result
+ * runs in **1221ms instead of 3475ms** (2.85×). The pass itself costs 1395ms on
+ * that 2745-face shape. On the finished document the same pass leaves **1312**
+ * faces (the tray 1085 → 187), which is where the display-side win comes from:
+ * tessellation 1.31s → 0.72s, edge extraction 290ms → 167ms.
+ *
+ * Placement is load-bearing and was measured both ways: applying it to every
+ * boolean result as it is produced is **18.7s** on the enclosure, while applying
+ * it once to the finished document is **21.4s** — the unified intermediate is
+ * what makes the NEXT boolean cheap, because a BOP's cost tracks its operands'
+ * face count.
+ *
+ * That is also the hazard, and it is the same one the rejected facet merge hit
+ * (see the module note): a unified shape IS handed to later booleans here, and
+ * "a unified operand" is exactly the condition this build fails on for a
+ * coplanar face-to-face contact. Two things make it acceptable rather than
+ * reckless — it is guarded (`IsNull`, the volume bound below, `try`/`catch`, and
+ * it only ever runs above `UNIFY_MIN_FACES`), and it is measured on the very
+ * model that exposed the facet merge: with this pass on and that one off the
+ * enclosure still comes back as its design's 10 solids at 32047.3837mm³. If a
+ * contact ever does fail, the first thing to try is raising `UNIFY_MIN_FACES`
+ * (the finished-document variant costs 2.5s of build time and is otherwise
+ * identical).
+ *
+ * The three flags are `(unifyEdges, unifyFaces, concatBSplines)` — the
+ * combination the roadmap's own probe verified; B-spline concatenation is left
+ * off because these shapes carry none.
+ *
+ * Three guards, all cheap: the volume bound below (same 1e-6 relative form
+ * `unionSound`/`cutSound` use, so a pass that silently dropped or added material
+ * is rejected and the un-merged result is kept), `IsNull`, and a `try`/`catch` —
+ * the pass is a courtesy, never a correctness dependency.
+ *
+ * **Only above `UNIFY_MIN_FACES`.** Below that the pass costs more than it saves
+ * and it would churn the face decomposition of small models for no gain —
+ * bracket.csg's 30-face result is exactly that case (39ms to merge 30 faces into
+ * 26), and `npm run mcp:smoke` pins that count.
+ */
+const UNIFY_MIN_FACES = 256;
+
+function unifyFragmented(
+  oc: Oc,
+  shape: Shape,
+  cleanup: Cleanup,
+  warn: (m: string) => void,
+  label: string,
+): Shape {
+  let faces = 0;
+  try {
+    faces = countFaces(oc, shape);
+  } catch {
+    return shape;
+  }
+  if (faces < UNIFY_MIN_FACES) return shape;
+  const before = shapeVolume(oc, shape, cleanup);
+  let merged: Shape | null = null;
+  try {
+    const up = new oc.ShapeUpgrade_UnifySameDomain_2(shape, true, true, false);
+    try {
+      up.Build();
+      merged = up.Shape();
+    } finally {
+      up.delete();
+    }
+  } catch (e) {
+    warn(`${label} — same-domain cleanup threw (${e instanceof Error ? e.message : String(e)}) — keeping the un-merged result`);
+    return shape;
+  }
+  if (!merged || isNullShape(merged)) return shape;
+  cleanup.push(merged);
+  const after = shapeVolume(oc, merged, cleanup);
+  if (!Number.isFinite(before) || !Number.isFinite(after) || Math.abs(after - before) > Math.abs(before) * 1e-6 + 1e-9) {
+    warn(
+      `${label} — same-domain cleanup changed the volume (${before} → ${after}) — keeping the un-merged result`,
+    );
+    return shape;
+  }
+  return merged;
+}
+
+/** Swaps in `unifyFragmented`'s result while keeping the "did WE build this
+ * handle, and may we free it" bookkeeping straight — a merged shape is a new
+ * handle, so the un-merged one is only released when this walk owned it (never
+ * when it came from a child, or from the caller-supplied operand list). */
+function replaced(
+  oc: Oc,
+  acc: Shape,
+  accOwned: boolean,
+  cleanup: Cleanup,
+  warn: (m: string) => void,
+  label: string,
+): Shape {
+  const merged = unifyFragmented(oc, acc, cleanup, warn, label);
+  if (merged === acc) return acc;
+  if (accOwned) release(cleanup, acc);
+  return merged;
+}
+
 /**
  * Evaluates one child subtree, containing a fault to that child alone.
  *
@@ -972,7 +1164,7 @@ function evalShapes(oc: Oc, node: CsgNode, cleanup: Cleanup, warn: (m: string) =
         fast = null;
       }
       if (fast) {
-        if (unionSound(oc, all, fast, cleanup)) return [fast];
+        if (unionSound(oc, all, fast, cleanup)) return [replaced(oc, fast, true, cleanup, warn, `${name}()`)];
         warn(`union() — the single-call form failed its volume bounds — combining pairwise`);
       }
     }
@@ -1020,7 +1212,7 @@ function evalShapes(oc: Oc, node: CsgNode, cleanup: Cleanup, warn: (m: string) =
       warn(`${name}() — no operand could be combined; keeping ${all.length} operand(s) uncombined`);
       return all;
     }
-    return [acc];
+    return [replaced(oc, acc, accOwned, cleanup, warn, `${name}()`)];
   }
   if (name === "difference") {
     if (node.children.length === 0) { warn(`difference() with no children — skipping`); return []; }
@@ -1044,7 +1236,7 @@ function evalShapes(oc: Oc, node: CsgNode, cleanup: Cleanup, warn: (m: string) =
         fast = null;
       }
       if (fast) {
-        if (cutSound(oc, acc, fast, cleanup)) return [fast];
+        if (cutSound(oc, acc, fast, cleanup)) return [replaced(oc, fast, true, cleanup, warn, "difference()")];
         warn(`difference() — the single-call form failed its volume bound — cutting one at a time`);
       }
     }
@@ -1083,7 +1275,7 @@ function evalShapes(oc: Oc, node: CsgNode, cleanup: Cleanup, warn: (m: string) =
         `difference() — ${failed} of ${rest.length} cut(s) did not complete; those subtrahends were left uncut`,
       );
     }
-    return [acc];
+    return [replaced(oc, acc, accOwned, cleanup, warn, "difference()")];
   }
   if (name === "multmatrix" || name === "translate" || name === "scale" || name === "mirror" || name === "rotate") {
     const m = nodeMatrix(node, warn);
