@@ -55,6 +55,9 @@ test/integration/.build/
 scripts/compat/last-run.json
 scripts/probe/scratch/
 scripts/probe/.build/
+# `npm run scad:check -- <model.scad> --render` writes its PNGs here; the probe
+# creates the directory on demand, so it must not be committable.
+scad-render/
 
 # Per-document sidecars the extension writes beside a CAD source, plus the
 # one-deep <model>.bak save backup and the generated .geo script. These are

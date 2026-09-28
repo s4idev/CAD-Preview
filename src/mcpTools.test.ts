@@ -991,6 +991,32 @@ describe("measure_exact", () => {
     );
     await expect(measureExactTool(c, { path: stpModel, kind: "distance", entityIdA: "solid-0" })).rejects.toThrow(/entityIdB/);
   });
+
+  it("forwards kind='angle' with both ids and returns the line angle beside the raw one", async () => {
+    const c = ctx(
+      fakePipeline({
+        measureExact: vi.fn(async () => ({ kind: "angle" as const, value: 180, lineAngleDeg: 0 })),
+      })
+    );
+    const result = await measureExactTool(c, { path: stpModel, kind: "angle", entityIdA: "face-0", entityIdB: "face-1" });
+    expect(c.pipeline.measureExact).toHaveBeenCalledWith(dir, expect.any(Uint8Array), "step", [], "angle", "face-0", "face-1");
+    // The additive field must survive the spread — it is the number that answers
+    // "are these parallel?", which the raw 180 cannot.
+    expect(result).toMatchObject({ supported: true, kind: "angle", value: 180, lineAngleDeg: 0 });
+  });
+
+  it("surfaces the kernel's refusal for a non-planar face / curved edge verbatim", async () => {
+    const c = ctx(
+      fakePipeline({
+        measureExact: vi.fn(async () => {
+          throw new Error("This face is cylinder, not planar — angle is only defined for planar faces and straight edges");
+        }),
+      })
+    );
+    await expect(
+      measureExactTool(c, { path: stpModel, kind: "angle", entityIdA: "face-3", entityIdB: "face-4" })
+    ).rejects.toThrow(/not planar/);
+  });
 });
 
 describe("check_tolerance", () => {
@@ -1028,6 +1054,26 @@ describe("check_tolerance", () => {
     expect(result.deviation).toBeCloseTo(1, 12);
     expect(result.withinTolerance).toBe(false);
     expect(result.tolerance.minus).toBe(0.1); // minus defaulted to plus (symmetric ±)
+  });
+
+  it("checks a band in DEGREES for an angle with the same arithmetic as a length", async () => {
+    const c = ctx(
+      fakePipeline({
+        measureExact: vi.fn(async () => ({ kind: "angle" as const, value: 44.6, lineAngleDeg: 44.6 })),
+      })
+    );
+    const result = await checkToleranceTool(c, {
+      path: stpModel,
+      kind: "angle",
+      entityIdA: "face-0",
+      entityIdB: "face-2",
+      nominal: 45,
+      tolerancePlus: 0.5,
+    });
+    expect(c.pipeline.measureExact).toHaveBeenCalledWith(dir, expect.any(Uint8Array), "step", [], "angle", "face-0", "face-2");
+    expect(result.measurement).toMatchObject({ kind: "angle", value: 44.6, lineAngleDeg: 44.6 });
+    expect(result.deviation).toBeCloseTo(-0.4, 12);
+    expect(result.withinTolerance).toBe(true);
   });
 
   it("rejects non-finite or negative allowances up front, without touching WASM", async () => {

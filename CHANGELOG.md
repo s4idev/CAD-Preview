@@ -4,6 +4,33 @@ All notable changes to the "CAD Preview" extension are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); this project does not yet strictly follow Semantic Versioning (pre-1.0 releases moved fast and bundled multiple features per bump).
 
+## [3.6.6] - 2026-09-27
+
+### Added
+
+- **Every measurement tool now has an exact counterpart, Angle included.** The
+  Measure panel's **⟟ Exact** button used to be offered for Distance, Edge
+  Length and Radius only. Clicking it after an Angle measurement now recomputes
+  the angle against the true OCCT geometry — between the two picked entities'
+  own directions (a planar face's normal, or a straight edge's direction) — so
+  the panel is no longer one tool short of complete. A curved face or a curved
+  edge is refused with an explanatory message rather than reported as a
+  made-up number. Exact angles also report the **line angle**
+  (`min(angle, 180 − angle)`): a stored direction can point either way, so a
+  genuinely parallel pair can read 0° or 180°, and the line angle is the
+  reading that answers "are these parallel or perpendicular?".
+- **The exact readout now names the facts it used to compute and discard.** An
+  exact distance shows the perpendicular plane gap (`parallel …`), the
+  centre-to-centre distance (`centre …`) and the infinite-axis separation for
+  two cylindrical faces (`axis …`) beside the minimum distance, e.g.
+  `D_exact = 12.5 mm · parallel 12.5 mm · centre 30.2 mm`. An extra that only
+  repeats the primary value is omitted, so the line stays readable.
+
+### Changed
+
+- `measure_exact` and `check_tolerance` accept `kind: "angle"` (both need
+  `entityIdB`). A tolerance band on an angle is in **degrees**, not millimetres.
+
 ## [3.6.5] - 2026-09-27
 
 ### Changed
@@ -776,6 +803,7 @@ This release republishes v1.9.0's full changelog (below) unchanged; v1.9.0 itsel
 
 - Initial release: read-only 3D preview for CAD and mesh files (STEP, IGES, BREP, STL, OBJ, PLY, glTF) inside a VS Code custom editor, using OpenCascade.js (OCCT WASM) in the extension host for B-rep formats and Three.js in the webview for rendering.
 
+[3.6.6]: https://github.com/loumalouomega/CAD-Preview/compare/v3.6.5...v3.6.6
 [3.6.5]: https://github.com/loumalouomega/CAD-Preview/compare/v3.6.4...v3.6.5
 [3.6.4]: https://github.com/loumalouomega/CAD-Preview/compare/v3.6.3...v3.6.4
 [3.6.3]: https://github.com/loumalouomega/CAD-Preview/compare/v3.6.0...v3.6.3

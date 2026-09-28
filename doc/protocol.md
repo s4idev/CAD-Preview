@@ -830,7 +830,7 @@ Sent in reply to `selectorSynthesizeRequest` — the Edits panel's **Pin query**
 
 ### `measureExactResult` / `measureExactError`
 
-Sent in reply to `measureExactRequest` — **B-rep sources only**, same gate as `massPropertiesResult`. A genuine host round trip via live OCCT geometry (`BRepExtrema_DistShapeShape` for `kind: "distance"`, `BRepGProp` for `"edgeLength"`, the edge's own curve for `"radius"`), distinct from both the interactive Measure tool's default instant triangulated-approximation result and `measure`'s bbox-centre-to-bbox-centre convention. See [Extension Host API](./extension-host-api.md#src-entityfacts-ts)'s verified call sequence for each `kind`.
+Sent in reply to `measureExactRequest` — **B-rep sources only**, same gate as `massPropertiesResult`. A genuine host round trip via live OCCT geometry (`BRepExtrema_DistShapeShape` for `kind: "distance"`, `BRepGProp` for `"edgeLength"`, the edge's own curve for `"radius"`, the entities' own stored directions for `"angle"`), distinct from both the interactive Measure tool's default instant triangulated-approximation result and `measure`'s bbox-centre-to-bbox-centre convention. `kind: "angle"` adds `lineAngleDeg` beside `value`. See [Extension Host API](./extension-host-api.md#src-entityfacts-ts)'s verified call sequence for each `kind`.
 
 ```json
 { "type": "measureExactResult", "requestId": "1234-0.56", "result": { "kind": "distance", "value": 83.305, "fromPoint": [0.5, 0.5, 0.5], "toPoint": [47.88, 47.88, 50] } }
@@ -1314,7 +1314,7 @@ Sent when the Clash panel's **Check** / **Check all** button is clicked, for a B
 
 ### `measureExactRequest`
 
-Sent when the Measure panel's **⟳ Exact** button is clicked, for a B-rep source only (mesh sources never send this — the button never appears; see `measureExactResult` above). `kind` mirrors the current measurement tool (`"distance"`/`"edgeLength"`/`"radius"` — never `"angle"`, which has no button at all); `entityIdA`/`entityIdB` are the completed measurement's picked entity ids (`entityIdB` only for `kind: "distance"`).
+Sent when the Measure panel's **⟳ Exact** button is clicked, for a B-rep source only (mesh sources never send this — the button never appears; see `measureExactResult` above). `kind` mirrors the current measurement tool (`"distance"`/`"edgeLength"`/`"radius"`/`"angle"`); `entityIdA`/`entityIdB` are the completed measurement's picked entity ids (`entityIdB` for `kind: "distance"` and `kind: "angle"`, single-pick tools for the other two).
 
 ```json
 { "type": "measureExactRequest", "requestId": "1234-0.56", "kind": "distance", "entityIdA": "solid-0", "entityIdB": "solid-1" }

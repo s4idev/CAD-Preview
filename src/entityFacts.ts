@@ -167,7 +167,7 @@ export interface EntityFacts {
   curveType: CurveType | null;
 }
 
-export type ExactMeasureKind = "distance" | "edgeLength" | "radius";
+export type ExactMeasureKind = "distance" | "edgeLength" | "radius" | "angle";
 
 export interface ExactMeasureResult {
   kind: ExactMeasureKind;
@@ -200,6 +200,19 @@ export interface ExactMeasureResult {
    * always the dimension being asked about), else `"min"`. A fact about
    * which quantity fits the pair's geometry, never a judgment of the value. */
   primary?: "min" | "parallel";
+  /** `kind: "angle"` only — the SAME angle as `value` but measured between the
+   * two infinite LINES the directions lie on, i.e. `min(value, 180 − value)`,
+   * in `[0, 90]`. Not redundant: it is the orientation-independent answer, and
+   * the raw `value` CANNOT answer "are these two parallel?" reliably. Measured
+   * on `examples/STP/block.stp` (a 3×4×5 box): the two opposite x-faces report
+   * the SAME plane normal (0°), while the two opposite y-faces report
+   * antiparallel ones (180°) — the stored direction of a face or edge is
+   * whatever OCCT's `gp_Pln`/`gp_Lin` happens to hold, so a parallel pair reads
+   * 0 or 180 arbitrarily, even within one solid. Perpendicular pairs are
+   * unaffected (90 either way). Use this field when the question is "how much
+   * do these two directions differ", and `value` when the directions' own
+   * orientations are what you are measuring. */
+  lineAngleDeg?: number;
 }
 
 export interface MeasureResult {
@@ -450,6 +463,57 @@ export async function measureEntities(
 }
 
 /**
+ * The direction an exact angle measurement uses for ONE entity, plus a label
+ * naming where it came from. A planar face contributes its plane normal; a
+ * straight edge its line direction. Everything else refuses with a clear
+ * message naming what it got — the same "a meaningless best-fit number is
+ * worse than an error" rule `measureExact`'s `radius` kind follows for a
+ * non-circular edge.
+ *
+ * Verified against the live WASM before shipping: `BRepAdaptor_Curve_2(edge)`
+ * `.GetType()` compared symbolically against `oc.GeomAbs_CurveType.GeomAbs_Line`
+ * (never a hardcoded ordinal — the `radius` kind's own convention), then
+ * `.Line().Direction()` — `gp_Lin` inherits `Direction()` from `gp_Ax1`, which
+ * embind exposes through the base class the same way `BRep_Builder.Add` comes
+ * from `TopoDS_Builder`. Probe: `scripts/probe/scratch/exact-angle.ts`.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function measureDirectionOf(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  oc: any,
+  kind: EntityFacts["kind"],
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  handle: any,
+  cleanup: Array<{ delete(): void }>
+): Vec3 {
+  if (kind === "face") {
+    const plane = facePlane(oc, handle, cleanup);
+    if (!plane) {
+      const surface = faceSurfaceInfo(oc, handle, cleanup).type;
+      throw new Error(
+        `This face is ${surface}, not planar — angle is only defined for planar faces and straight edges`
+      );
+    }
+    return normalizeVec(plane.nl);
+  }
+  if (kind === "edge") {
+    const curve = new oc.BRepAdaptor_Curve_2(handle);
+    cleanup.push(curve);
+    if (curve.GetType().value !== oc.GeomAbs_CurveType.GeomAbs_Line.value) {
+      throw new Error(
+        "This edge is not a straight line — angle is only defined for planar faces and straight edges"
+      );
+    }
+    const line = curve.Line();
+    cleanup.push(line);
+    const d = line.Direction();
+    cleanup.push(d);
+    return normalizeVec([d.X(), d.Y(), d.Z()]);
+  }
+  throw new Error(`"angle" requires a planar face or a straight edge; got a ${kind}`);
+}
+
+/**
  * Exact B-rep-precision measurement — a host round trip an agent (or, via
  * `measureExactRequest`, the interactive webview Measure tool) opts into on
  * top of the always-available, instant client-side triangulated
@@ -513,6 +577,33 @@ export async function measureEntities(
  * `bull.stp` resolved to a plausible `2.5399999999998477`. A non-circular
  * edge (line, B-spline, ellipse, …) throws a clear, actionable error rather
  * than silently returning a meaningless "best-fit" number.
+ *
+ * **`kind: "angle"`** — the angle between two entities' DIRECTIONS
+ * (`measureDirectionOf` above: a planar face's plane normal, or a straight
+ * edge's line direction), `0…180`, plus `lineAngleDeg` (`min(value, 180 −
+ * value)`, `0…90`) which is the orientation-independent reading of the same
+ * pair. Needs `entityIdB`, and either side may be a face or an edge in any
+ * combination — a face and an edge is a legitimate "how is this edge inclined
+ * to that face" question. A non-planar face, a curved edge, a solid or a
+ * point refuses by name rather than reporting a meaningless number.
+ *
+ * **`lineAngleDeg` exists because the raw angle genuinely cannot answer "are
+ * these two parallel?" — measured, not assumed** (probe:
+ * `scripts/probe/scratch/exact-angle.ts`, which is also where `curve.Line()`
+ * → `.Direction()` was confirmed bound). On `examples/STP/block.stp`, a real
+ * 3×4×5 box: `face-0`/`face-1` (the two opposite x-faces) report the SAME
+ * normal, so their raw angle is **0°**, while `face-2`/`face-4` (the opposite
+ * y-faces) report **antiparallel** ones, so theirs is **180°** — both pairs
+ * parallel, both directions arbitrary, and the arbitrariness differs WITHIN one
+ * solid. The same holds for edges (`edge-0`/`edge-2` = 180° while
+ * `edge-1`/`edge-5` = 0°). Perpendicular pairs are unaffected: every
+ * perpendicular face/edge pair on that box reads exactly 90°. So the stored
+ * direction of a face or edge is whatever OCCT's `gp_Pln`/`gp_Lin` happens to
+ * hold — which is why `value` is reported exactly as the directions give it
+ * (the same `acos` of the unit dot the interactive viewer's Measure tool
+ * already computes from its picked normals/tangents, so the two agree whenever
+ * the two directions agree) and `lineAngleDeg` is published beside it for the
+ * question the raw number cannot answer.
  */
 export async function measureExact(
   extensionPath: string,
@@ -591,6 +682,17 @@ export async function measureExact(
       }
       result.primary ??= "min";
       return result;
+    }
+
+    // kind === "angle"
+    if (kind === "angle") {
+      if (!entityIdB) throw new Error('"angle" requires entityIdB');
+      const b = resolveEntity(oc, shape, entityIdB, cleanup);
+      const dirA = measureDirectionOf(oc, a.kind, a.handle, cleanup);
+      const dirB = measureDirectionOf(oc, b.kind, b.handle, cleanup);
+      const cosAngle = clamp(dirA[0] * dirB[0] + dirA[1] * dirB[1] + dirA[2] * dirB[2], -1, 1);
+      const value = (Math.acos(cosAngle) * 180) / Math.PI;
+      return { kind, value, lineAngleDeg: Math.min(value, 180 - value) };
     }
 
     if (kind === "edgeLength") {

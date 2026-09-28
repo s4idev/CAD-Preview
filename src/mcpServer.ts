@@ -455,15 +455,15 @@ server.registerTool(
   "measure_exact",
   {
     description:
-      "Exact B-rep-precision measurement via live OCCT geometry (BRepExtrema_DistShapeShape for distance, BRepGProp for edge length, the edge's own curve for radius) — not an approximation, unlike `measure`'s bbox-centre distance or the interactive viewer's triangulated Measure tool. kind='distance' needs entityIdB (any entity combination: point/edge/face/solid) and returns the true minimum distance plus the realizing points where it lands, centreDistance (bbox-centre-to-bbox-centre, what `measure` reports), axisDistance for two cylindrical faces (shortest infinite-axis separation), and — for two planar faces — angleDeg between their normals and parallelDistance (perpendicular plane-to-plane gap) when the planes are parallel; `primary` names which value most likely answers 'how far apart are these' for that pair ('parallel' for two parallel planar faces, else 'min') — a fact about which quantity fits the geometry, never a judgment of it. There is NO maximum-distance field: probed and genuinely unavailable in this WASM build. kind='edgeLength' needs entityIdA to be an edge. kind='radius' needs entityIdA to be a circular edge (throws a clear error otherwise — never a meaningless best-fit number). B-rep sources only headless.",
+      "Exact B-rep-precision measurement via live OCCT geometry (BRepExtrema_DistShapeShape for distance, BRepGProp for edge length, the edge's own curve for radius, the entities' own stored directions for angle) — not an approximation, unlike `measure`'s bbox-centre distance or the interactive viewer's triangulated Measure tool. kind='distance' needs entityIdB (any entity combination: point/edge/face/solid) and returns the true minimum distance plus the realizing points where it lands, centreDistance (bbox-centre-to-bbox-centre, what `measure` reports), axisDistance for two cylindrical faces (shortest infinite-axis separation), and — for two planar faces — angleDeg between their normals and parallelDistance (perpendicular plane-to-plane gap) when the planes are parallel; `primary` names which value most likely answers 'how far apart are these' for that pair ('parallel' for two parallel planar faces, else 'min') — a fact about which quantity fits the geometry, never a judgment of it. There is NO maximum-distance field: probed and genuinely unavailable in this WASM build. kind='angle' needs entityIdB, and each side must be a planar face (its plane normal) or a straight edge (its line direction); it returns `value` (the angle between those two directions, 0..180) and `lineAngleDeg` (min(value, 180-value), 0..90 — the orientation-independent reading). Use lineAngleDeg to ask 'are these parallel/perpendicular': a stored direction is arbitrary, so a genuinely PARALLEL pair can read 0 or 180 depending on which way each face's or edge's direction happens to point (measured on a box: one opposite-face pair 0, another 180). A non-planar face or a curved edge throws a clear error rather than reporting a meaningless number. kind='edgeLength' needs entityIdA to be an edge. kind='radius' needs entityIdA to be a circular edge (throws a clear error otherwise — never a meaningless best-fit number). B-rep sources only headless.",
     inputSchema: {
       path: modelPath,
-      kind: z.enum(["distance", "edgeLength", "radius"]),
+      kind: z.enum(["distance", "edgeLength", "radius", "angle"]),
       entityIdA: z.string().describe("solid-N / face-N / edge-N / point-N id"),
-      entityIdB: z.string().optional().describe("solid-N / face-N / edge-N / point-N id — required for kind='distance'"),
+      entityIdB: z.string().optional().describe("solid-N / face-N / edge-N / point-N id — required for kind='distance' and kind='angle'"),
     },
   },
-  wrap((args: { path: string; kind: "distance" | "edgeLength" | "radius"; entityIdA: string; entityIdB?: string }) =>
+  wrap((args: { path: string; kind: "distance" | "edgeLength" | "radius" | "angle"; entityIdA: string; entityIdB?: string }) =>
     measureExactTool(ctx, args)
   )
 );
@@ -472,13 +472,13 @@ server.registerTool(
   "check_tolerance",
   {
     description:
-      "Tolerance-band fact check on top of an exact measurement: runs the SAME exact measurement measure_exact performs (B-rep precision, same kind/entityId rules), then reports the measured value alongside deviation = measured − nominal and withinTolerance (true when −toleranceMinus ≤ deviation ≤ tolerancePlus). toleranceMinus defaults to tolerancePlus (symmetric ±) when omitted. withinTolerance is a FACT about where the value sits relative to the band you supplied — never a pass/fail verdict; you render the judgment. No new geometry is computed and nothing is persisted.",
+      "Tolerance-band fact check on top of an exact measurement: runs the SAME exact measurement measure_exact performs (B-rep precision, same kind/entityId rules — including kind='angle'), then reports the measured value alongside deviation = measured − nominal and withinTolerance (true when −toleranceMinus ≤ deviation ≤ tolerancePlus). toleranceMinus defaults to tolerancePlus (symmetric ±) when omitted. nominal and the allowances are in the measurement's own unit: mm for distance/edgeLength/radius, DEGREES for angle. withinTolerance is a FACT about where the value sits relative to the band you supplied — never a pass/fail verdict; you render the judgment. No new geometry is computed and nothing is persisted.",
     inputSchema: {
       path: modelPath,
-      kind: z.enum(["distance", "edgeLength", "radius"]),
+      kind: z.enum(["distance", "edgeLength", "radius", "angle"]),
       entityIdA: z.string().describe("solid-N / face-N / edge-N / point-N id"),
-      entityIdB: z.string().optional().describe("solid-N / face-N / edge-N / point-N id — required for kind='distance'"),
-      nominal: z.number().describe("Nominal (target) value, same unit as the measurement (mm for distance/edgeLength/radius)"),
+      entityIdB: z.string().optional().describe("solid-N / face-N / edge-N / point-N id — required for kind='distance' and kind='angle'"),
+      nominal: z.number().describe("Nominal (target) value, same unit as the measurement (mm for distance/edgeLength/radius, degrees for angle)"),
       tolerancePlus: z.number().describe("Allowed deviation above nominal (≥ 0)"),
       toleranceMinus: z
         .number()
@@ -486,7 +486,7 @@ server.registerTool(
         .describe("Allowed deviation below nominal (≥ 0); omitted = symmetric ± with tolerancePlus"),
     },
   },
-  wrap((args: { path: string; kind: "distance" | "edgeLength" | "radius"; entityIdA: string; entityIdB?: string; nominal: number; tolerancePlus: number; toleranceMinus?: number }) =>
+  wrap((args: { path: string; kind: "distance" | "edgeLength" | "radius" | "angle"; entityIdA: string; entityIdB?: string; nominal: number; tolerancePlus: number; toleranceMinus?: number }) =>
     checkToleranceTool(ctx, args)
   )
 );

@@ -1360,7 +1360,7 @@ test("dropdowns: clicking an open trigger's inner icon closes it", async (page) 
  * failure text rather than a guess. If one of these fails: measure, then update
  * BOTH this test and the clip in `capture.mjs` together.
  */
-const FILE_MENU_CLIP = { x: 0, y: 0, width: 320, height: 439 };
+const FILE_MENU_CLIP = { x: 0, y: 0, width: 320, height: 445 };
 const TOOLBAR_MENU_CLIP = { x: 750, y: 30, width: 610, height: 500 };
 
 const panelBox = (page, id) =>
@@ -2236,6 +2236,115 @@ test("inspector card: selection requests facts, and the reply renders per classi
   assert(
     (await cardTitle()) === "Cylindrical face",
     `a reply with a stale requestId is ignored (got ${await cardTitle()})`
+  );
+});
+
+/**
+ * N2. ❟ Exact for the angle tool, and the readout's extra facts (roadmap
+ * "Complete measurement tools").
+ *
+ * Every measurement tool now has an exact counterpart, Angle included: its
+ * `measureExact` kind measures between each picked entity's OWN stored
+ * direction (a planar face's normal, a straight edge's line direction). The
+ * kernel half is asserted against live OCCT in `npm run mcp:smoke`; what needs
+ * checking here is the webview wiring over the real bundle — that a completed
+ * angle measurement makes `#measure-exact-btn` available (before this feature
+ * the button was deliberately never offered for Angle), that clicking it posts
+ * `kind: "angle"` with both ids, and that the reply's additive facts reach the
+ * readout instead of being dropped on the floor the way they used to be.
+ */
+test("exact measure: the angle tool gets an Exact button, and extra facts reach the readout", async (page) => {
+  await populate(page);
+  const readout = () => page.evaluate(() => document.getElementById("measure-readout")?.textContent ?? null);
+  const exactShown = () =>
+    page.evaluate(() => document.getElementById("measure-exact-btn")?.offsetParent !== null);
+  const lastRequest = (type) =>
+    page.evaluate((t) => (window.__sent ?? []).findLast((m) => m.type === t) ?? null, type);
+  const reply = (requestId, result) =>
+    post(page, { type: "measureExactResult", requestId, result });
+
+  assert((await exactShown()) === false, "no Exact button before any measurement exists");
+
+  await page.click("#measure-menu");
+  await page.click("#measure-toggle");
+  await page.click('.measure-tool-btn[data-tool="angle"]');
+  await page.click("#measure-menu"); // close the dropdown so the canvas clicks are picks
+  await sleep(150);
+
+  const box = await viewportBox(page);
+  await page.mouse.click(box.x + box.width * 0.48, box.y + box.height * 0.5);
+  await sleep(250);
+  await page.mouse.click(box.x + box.width * 0.52, box.y + box.height * 0.46);
+  await sleep(300);
+
+  const angleText = await readout();
+  assert(
+    typeof angleText === "string" && angleText.includes("°"),
+    `two picks with the Angle tool complete a measurement in degrees (got ${JSON.stringify(angleText)})`
+  );
+  assert(
+    (await exactShown()) === true,
+    "an angle measurement now offers ⟟ Exact — the button was never shown for Angle before this feature"
+  );
+
+  await page.click("#measure-exact-btn");
+  const req = await lastRequest("measureExactRequest");
+  assert(
+    req !== null && req.kind === "angle",
+    `clicking it posts measureExactRequest with kind "angle" (got ${JSON.stringify(req)})`
+  );
+  assert(
+    typeof req.entityIdA === "string" && typeof req.entityIdB === "string",
+    `... carrying BOTH picked ids, which the angle kind requires (got ${JSON.stringify(req)})`
+  );
+
+  // A stored direction is arbitrary, so a genuinely parallel pair can come back
+  // as 180° — the line angle is the reading that answers the question, and the
+  // readout must show both rather than only the startling one.
+  await reply(req.requestId, { kind: "angle", value: 180, lineAngleDeg: 0 });
+  await sleep(150);
+  const angleExact = await readout();
+  assert(
+    typeof angleExact === "string" && /A_exact = 180°/.test(angleExact),
+    `the exact angle renders as A_exact with a degree sign (got ${JSON.stringify(angleExact)})`
+  );
+  assert(
+    typeof angleExact === "string" && /line 0°/.test(angleExact),
+    `... and names the orientation-independent line angle beside it (got ${JSON.stringify(angleExact)})`
+  );
+
+  // The distance kind's additive facts (plane gap, centre distance), on the same
+  // readout — these were computed and thrown away before this change.
+  await page.click("#measure-menu");
+  await page.click('.measure-tool-btn[data-tool="distance"]');
+  await page.click("#measure-menu");
+  await sleep(150);
+  await page.mouse.click(box.x + box.width * 0.48, box.y + box.height * 0.5);
+  await sleep(250);
+  await page.mouse.click(box.x + box.width * 0.52, box.y + box.height * 0.46);
+  await sleep(300);
+  await page.click("#measure-exact-btn");
+  const distReq = await lastRequest("measureExactRequest");
+  await reply(distReq.requestId, {
+    kind: "distance",
+    value: 12.5,
+    primary: "parallel",
+    parallelDistance: 12.5,
+    centreDistance: 30,
+  });
+  await sleep(150);
+  const distText = await readout();
+  assert(
+    typeof distText === "string" && /D_exact = 12\.5/.test(distText),
+    `the exact distance still renders as D_exact (got ${JSON.stringify(distText)})`
+  );
+  assert(
+    typeof distText === "string" && /centre 30/.test(distText),
+    `... now naming the centre distance beside it (got ${JSON.stringify(distText)})`
+  );
+  assert(
+    typeof distText === "string" && !/parallel 12\.5/.test(distText),
+    `an extra that merely repeats the primary value is not repeated (got ${JSON.stringify(distText)})`
   );
 });
 

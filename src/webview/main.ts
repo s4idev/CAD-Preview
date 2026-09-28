@@ -87,7 +87,7 @@ import {
   type ClipPlaneState,
 } from "./clipping";
 import { MeasurementState, type MeasureTool, type MeasurementPick } from "./measurementState";
-import { pointDistance, polylineLength, angleBetweenVectors, circleRadiusFromArcPoints, type Vec3 } from "./measurement";
+import { pointDistance, polylineLength, angleBetweenVectors, circleRadiusFromArcPoints, exactReadout, type Vec3 } from "./measurement";
 import { convertLength, convertLengthBasedProperties, convertVolume, displayUnitFromUnitName, type DisplayUnit, type LengthBasedProperties } from "./units";
 import type { EntityFacts, ExactMeasureKind } from "../entityFacts";
 import { isDisplayMode, type DisplayMode } from "./displayMode";
@@ -3573,11 +3573,15 @@ function setMeasureReadout(text: string, isError = false): void {
   el.classList.toggle("measure-readout-error", isError);
 }
 
-/** Maps a `MeasureTool` to its exact-measurement counterpart, or `null` for
- * `"angle"` — `measureExact` (`entityFacts.ts`) has no "angle between two
- * picks" host analogue, only distance/edgeLength/radius. */
-function exactMeasureKindFor(tool: MeasureTool): ExactMeasureKind | null {
-  return tool === "angle" ? null : tool;
+/** Maps a `MeasureTool` to its exact-measurement counterpart. Every tool now
+ * has one, `"angle"` included: `measureExact`'s `"angle"` kind takes the two
+ * picked entities' own directions (a planar face's plane normal, or a straight
+ * edge's line direction) and reports both the raw direction angle and the
+ * orientation-independent `lineAngleDeg` — the client-side tool derives the
+ * same kind of direction from its picked normals/tangents, so the two agree
+ * whenever the directions agree. */
+function exactMeasureKindFor(tool: MeasureTool): ExactMeasureKind {
+  return tool;
 }
 
 /** The most recently completed measurement's tool + resolved picks + result —
@@ -3700,7 +3704,9 @@ function refreshExactButton(): void {
   const kind = lastMeasurement ? exactMeasureKindFor(lastMeasurement.tool) : null;
   const entityIdA = lastMeasurement?.picks[0]?.entityId;
   const entityIdB = lastMeasurement?.picks[1]?.entityId;
-  const available = sourceKind === "brep" && kind !== null && !!entityIdA && (kind !== "distance" || !!entityIdB);
+  // "distance" and "angle" are two-entity measurements; the other two take one.
+  const needsB = kind === "distance" || kind === "angle";
+  const available = sourceKind === "brep" && kind !== null && !!entityIdA && (!needsB || !!entityIdB);
   btn.hidden = !available;
   btn.disabled = !available;
 }
@@ -3802,7 +3808,7 @@ function setupMeasureControls(): void {
     const kind = exactMeasureKindFor(lastMeasurement.tool);
     const entityIdA = lastMeasurement.picks[0]?.entityId;
     const entityIdB = lastMeasurement.picks[1]?.entityId ?? undefined;
-    if (!kind || !entityIdA) return;
+    if (!entityIdA) return;
     const requestId = `${Date.now()}-${Math.random()}`;
     measureExactRequestId = requestId;
     exactBtn.disabled = true;
@@ -5668,8 +5674,12 @@ window.addEventListener("message", async (event: MessageEvent<HostToWebview>) =>
 
     case "measureExactResult": {
       if (msg.requestId !== measureExactRequestId) break; // stale — a newer request/Clear superseded it
-      const label = msg.result.kind === "distance" ? "D" : msg.result.kind === "edgeLength" ? "L" : "R";
-      setMeasureReadout(`${label}_exact = ${formatMeasureLength(msg.result.value)}`);
+      const { label, value, extras } = exactReadout(
+        msg.result,
+        formatMeasureLength,
+        (deg) => `${formatMeasure(deg)}°`
+      );
+      setMeasureReadout(`${label}_exact = ${value}${extras.length ? ` · ${extras.join(" · ")}` : ""}`);
       (document.getElementById("measure-exact-btn") as HTMLButtonElement | null)?.removeAttribute("disabled");
       break;
     }

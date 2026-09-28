@@ -993,6 +993,41 @@ try {
       perp.parallelDistance === undefined && perp.primary === "min",
       "measure_exact omits parallelDistance and names \"min\" as primary for a non-parallel pair"
     );
+
+    // kind "angle" (roadmap "Complete measurement tools"): the same two pairs,
+    // measured between the faces' OWN STORED directions. The parallel pair is
+    // the point of the whole feature — its raw value is 0° or 180° depending on
+    // which way each stored `gp_Pln` normal happens to point (measured: the two
+    // cases occur on opposite pairs of the very same box), so `lineAngleDeg` is
+    // the field that actually answers "are these parallel?". Both are asserted;
+    // a "close enough" value would let the arbitrary case pass as correct.
+    const paraAngle = await call("measure_exact", { path: model, kind: "angle", entityIdA: paraPair[0].id, entityIdB: paraPair[1].id });
+    assert(
+      paraAngle.kind === "angle" && (Math.abs(paraAngle.value) < 1e-6 || Math.abs(paraAngle.value - 180) < 1e-6),
+      `measure_exact angle reports a parallel face pair's raw direction angle as 0° or 180° (got ${paraAngle.value})`
+    );
+    assert(
+      Math.abs(paraAngle.lineAngleDeg) < 1e-6,
+      `... and its lineAngleDeg as exactly 0° regardless of which way each normal points (got ${paraAngle.lineAngleDeg})`
+    );
+    const perpAngle = await call("measure_exact", { path: model, kind: "angle", entityIdA: perpPair[0].id, entityIdB: perpPair[1].id });
+    assert(
+      Math.abs(perpAngle.value - 90) < 1e-6 && Math.abs(perpAngle.lineAngleDeg - 90) < 1e-6,
+      `measure_exact angle reports perpendicular faces as exactly 90° on both readings (got ${perpAngle.value} / ${perpAngle.lineAngleDeg})`
+    );
+
+    // Refusals: a solid has no direction to measure, and the second id is
+    // mandatory. A fabricated angle would be the failure mode worth catching.
+    const solidAngle = await callTolerant("measure_exact", { path: model, kind: "angle", entityIdA: "solid-0", entityIdB: "solid-1" });
+    assert(
+      /requires a planar face or a straight edge/.test(solidAngle.error ?? ""),
+      `measure_exact refuses kind='angle' for a solid by name (got ${JSON.stringify(solidAngle.error ?? solidAngle.value)})`
+    );
+    const oneAngleId = await callTolerant("measure_exact", { path: model, kind: "angle", entityIdA: "solid-0" });
+    assert(
+      /entityIdB/.test(oneAngleId.error ?? ""),
+      `measure_exact refuses kind='angle' with a single id (got ${JSON.stringify(oneAngleId.error ?? oneAngleId.value)})`
+    );
   }
 
   // A cylinder with a known radius, added specifically to verify radius/
@@ -1111,6 +1146,13 @@ try {
       Math.abs(len.value - 2 * Math.PI * knownRadius) < 1e-6,
       `measure_exact edgeLength on the cylinder's rim matches its circumference exactly (2*pi*r = ${(2 * Math.PI * knownRadius).toFixed(6)}, got ${len.value})`
     );
+    // The angle kind handles straight edges only: a circular rim has no single
+    // direction, so it must be refused rather than given a tangent's angle.
+    const curvedEdgeAngle = await callTolerant("measure_exact", { path: radiusTestModel, kind: "angle", entityIdA: `edge-${i}`, entityIdB: `edge-${i}` });
+    assert(
+      /not a straight line/.test(curvedEdgeAngle.error ?? ""),
+      `measure_exact refuses kind='angle' for a circular edge by name (got ${JSON.stringify(curvedEdgeAngle.error ?? curvedEdgeAngle.value)})`
+    );
     break;
   }
   assert(
@@ -1159,6 +1201,18 @@ try {
     }
     assert(cylFace !== null, `inspect finds the added cylinder's lateral face and reports radius ${R}`);
     if (cylFace) {
+      // The angle kind's other refusal, on a face whose direction varies over
+      // the surface: there is no single normal, so there is no angle to report.
+      const curvedFaceAngle = await callTolerant("measure_exact", {
+        path: surfModel,
+        kind: "angle",
+        entityIdA: cylFace.entityId,
+        entityIdB: cylFace.entityId,
+      });
+      assert(
+        /not planar/.test(curvedFaceAngle.error ?? ""),
+        `measure_exact refuses kind='angle' for a cylindrical face by name (got ${JSON.stringify(curvedFaceAngle.error ?? curvedFaceAngle.value)})`
+      );
       const p = cylFace.surfaceParams;
       assert(p.kind === "cylinder", `surfaceParams.kind matches surfaceType (got ${p.kind})`);
       assert(Math.abs(p.radius - R) < 1e-9, `cylinder radius is exact (expected ${R}, got ${p.radius})`);

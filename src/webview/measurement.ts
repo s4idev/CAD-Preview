@@ -9,6 +9,8 @@
  * exact `BRepExtrema_DistShapeShape` host round trip.
  */
 
+import type { ExactMeasureResult } from "../entityFacts";
+
 export type Vec3 = [number, number, number];
 
 export function pointDistance(a: Vec3, b: Vec3): number {
@@ -54,4 +56,56 @@ export function circleRadiusFromArcPoints(p0: Vec3, p1: Vec3, p2: Vec3): number 
   const twiceArea = Math.hypot(cross[0], cross[1], cross[2]);
   if (twiceArea < 1e-9) return null;
   return (a * b * c) / (2 * twiceArea);
+}
+
+/**
+ * One line's worth of presentation for an exact measurement: the readout's own
+ * `D_exact = …` shape, split into its parts so the interesting decisions are
+ * pure and testable rather than buried in a DOM handler.
+ *
+ * `extras` carries the additive facts `measureExact` publishes beside the
+ * primary value — the perpendicular plane-to-plane gap, the bbox-centre
+ * distance, the infinite-axis separation, the normal angle, and (for the angle
+ * kind) the orientation-independent line angle. Each is shown ONLY when it
+ * tells the reader something the primary value does not: an extra that formats
+ * to the same string as the value is dropped, which is what keeps a plain
+ * parallel-face measurement from reading `12.5 mm · parallel 12.5 mm`.
+ *
+ * The angle kind's `lineAngleDeg` uses the same rule, so it appears exactly
+ * when the raw direction angle is obtuse (e.g. 180° for two parallel faces
+ * whose stored normals happen to be antiparallel, where `0°` is the reading a
+ * user wants) and stays hidden when the raw value is already the intuitive one.
+ * Unit prefixes stay out of here: the caller passes the formatters, since
+ * display units are webview state.
+ */
+export function exactReadout(
+  result: ExactMeasureResult,
+  formatLength: (mm: number) => string,
+  formatDegrees: (deg: number) => string
+): { label: string; value: string; extras: string[] } {
+  const label =
+    result.kind === "distance"
+      ? "D"
+      : result.kind === "edgeLength"
+        ? "L"
+        : result.kind === "radius"
+          ? "R"
+          : "A";
+  const primary = result.kind === "angle" ? formatDegrees(result.value) : formatLength(result.value);
+
+  const candidates: string[] = [];
+  if (result.kind === "distance") {
+    if (result.primary === "parallel" && result.parallelDistance !== undefined) {
+      candidates.push(`parallel ${formatLength(result.parallelDistance)}`);
+    }
+    if (result.centreDistance !== undefined) candidates.push(`centre ${formatLength(result.centreDistance)}`);
+    if (result.axisDistance !== undefined) candidates.push(`axis ${formatLength(result.axisDistance)}`);
+    if (result.angleDeg !== undefined) candidates.push(`angle ${formatDegrees(result.angleDeg)}`);
+  } else if (result.kind === "angle" && result.lineAngleDeg !== undefined) {
+    candidates.push(`line ${formatDegrees(result.lineAngleDeg)}`);
+  }
+
+  // Drop an extra that merely repeats the primary value (`endsWith` covers the
+  // prefixed forms: "parallel 12.5 mm" ends with the value "12.5 mm").
+  return { label, value: primary, extras: candidates.filter((c) => !c.endsWith(primary)) };
 }

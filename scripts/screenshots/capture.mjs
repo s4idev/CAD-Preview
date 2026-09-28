@@ -152,8 +152,12 @@ const SHOTS = [
     // the last entry off rather than failing the run. Two more rows landed
     // with Import/Export DXF (285 → 342), one more with Export Technical
     // Drawing (342 → 371), and one more plus a separator with New Blank Model
-    // (371 → 410), and one more with Export Drawing Sheet (410 → 439).
-    target: { clip: { x: 0, y: 0, width: 320, height: 439 } },
+    // (371 → 410), and one more with Export Drawing Sheet (410 → 439). "Export
+    // Technical Drawing…" wraps onto two lines at this panel width, so the
+    // panel really measures 441 — the 439 clip was cropping its bottom border
+    // off the committed image (and the harness's own clip assertion had been
+    // failing on it). 445 clears the panel with a little headroom.
+    target: { clip: { x: 0, y: 0, width: 320, height: 445 } },
   },
   // The toolbar's four dropdowns. `clip` rather than `sel: "#toolbar"` — a
   // locator screenshot clips to the element box, which would cut off the
